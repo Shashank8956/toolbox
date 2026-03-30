@@ -54,7 +54,7 @@ setup_config:
 
 #### Related tools
 
-- **`machine_setup_monitor.py`** — Background daemon that watches `machines.yaml` for new entries and automatically triggers setup. Useful when machines are added by other scripts or teammates.
+- **`machine_setup_monitor.py`** — Background daemon that watches `machines.yaml` for new entries and automatically triggers setup.
 - **`notes_monitor.py`** — Monitors a macOS Notes entry in real-time (reads the Notes SQLite DB). Handy for tracking dynamically updated IPs or notes.
 - **`restore_backup.sh`** — Interactive script to restore `users.yaml.bak` backups on remote machines.
 
@@ -68,7 +68,7 @@ setup_config:
 
 ### dbfetch — DB Credentials Fetcher
 
-SSHes into remote staging servers, reads `config/database.yml`, extracts DB credentials, and saves them locally for use with `tsql` or any SQL client.
+SSHes into remote staging servers, reads `config/database.yml`, extracts DB credentials, and saves them locally.
 
 **Use case:** You have multiple staging servers each with their own database. Instead of manually SSHing into each box to look up creds, `dbfetch` does it for you and stores everything in one place.
 
@@ -82,15 +82,6 @@ dbfetch list                          # List servers and fetch status
 dbfetch show <name>                   # Display saved creds for a server
 dbfetch logs                          # Show recent logs
 ```
-
-#### How it works
-
-When you run `dbfetch fetch <name>`:
-1. SSHes into the server through the configured jump host
-2. Navigates to the Rails app directory
-3. Reads `config/database.yml`
-4. Extracts credentials from the `production` (or `staging`/`development`) block
-5. Saves them to `databases.yaml` locally
 
 #### Configuration
 
@@ -109,6 +100,66 @@ servers:
 ```
 
 > `databases.yaml` is gitignored — it will contain real credentials.
+
+---
+
+### sqlrun — SQL Query Tool
+
+Run tsql queries against any staging DB using saved credentials. Select a server once, query freely — no credentials ever typed.
+
+**Use case:** You have 20+ staging SQL Server DBs. `sqlrun` manages SSH tunnels and credentials behind the scenes — you just write SQL.
+
+#### Commands
+
+```bash
+sqlrun use <name>                    # Set active server (persists across sessions)
+sqlrun status                        # Show active server info
+sqlrun list                          # List all servers and their status
+sqlrun query "<SQL>"                 # Run query against active server
+sqlrun query --db <name> "<SQL>"     # One-off query without changing active server
+sqlrun query -f <file.sql>           # Run SQL from a file
+sqlrun shell                         # Open interactive SQL shell
+```
+
+#### Output formats
+
+```bash
+sqlrun query --format table "<SQL>"  # Aligned columns (default)
+sqlrun query --format tsv "<SQL>"    # Tab-separated (for agents/scripts)
+sqlrun query --format json "<SQL>"   # JSON array
+sqlrun query --no-headers "<SQL>"    # Omit column headers
+```
+
+#### Example workflow
+
+```bash
+# Pick your DB
+sqlrun use tallgrass-project
+
+# Query freely
+sqlrun query "SELECT TOP 10 * FROM users"
+
+# Pipe SQL in
+echo "SELECT @@VERSION" | sqlrun query
+
+# One-off on a different DB without changing active
+sqlrun query --db targa-project "SELECT COUNT(*) FROM jobs"
+
+# Interactive shell
+sqlrun shell
+```
+
+#### How it works
+
+1. Reads credentials from `databases.yaml` (populated by `dbfetch`)
+2. Opens an SSH tunnel through the bastion to the SQL Server
+3. Runs `tsql` locally against the tunnel
+4. Tears down the tunnel on exit
+
+#### Requirements
+
+- `tsql` (freetds): `brew install freetds`
+- Credentials fetched via `dbfetch fetch --all`
 
 ---
 

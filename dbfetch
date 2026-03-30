@@ -226,7 +226,7 @@ echo "STEP:DONE"
         creds = {
             'environment': chosen_env,
             'adapter':  chosen_config.get('adapter'),
-            'host':     chosen_config.get('host'),
+            'host':     chosen_config.get('host') or chosen_config.get('hostname') or chosen_config.get('dataserver'),
             'port':     chosen_config.get('port'),
             'database': chosen_config.get('database'),
             'username': chosen_config.get('username'),

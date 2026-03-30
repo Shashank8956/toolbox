@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""
+sqlrun — SQL Query Tool
+Run tsql queries against remote staging DBs using saved credentials.
+Select a DB once with `sqlrun use <name>`, then query freely.
+"""
+
+import sys
+import os
+import re
+import json
+import yaml
+import socket
+import signal
+import atexit
+import time
+import subprocess
+import logging
+import tempfile
+from pathlib import Path
+from datetime import datetime
+
+SCRIPT_DIR  = Path(__file__).resolve().parent
+CONFIG_FILE = SCRIPT_DIR / "databases.yaml"
+STATE_FILE  = Path.home() / ".sqlrun_state"
+LOG_FILE    = SCRIPT_DIR / "sqlrun.log"
+TSQL_BIN    = "/opt/homebrew/bin/tsql"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.FileHandler(LOG_FILE)]
+)
+logger = logging.getLogger(__name__)
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+class ConfigManager:
+    def __init__(self):
+        if not CONFIG_FILE.exists():
+            print(f"❌ databases.yaml not found at {CONFIG_FILE}")
+            print(f"   Run: python3 dbfetch fetch --all")
+            sys.exit(1)
+
+    def load(self):
+        with open(CONFIG_FILE) as f:
+            return yaml.safe_load(f)
+
+    def get_server(self, name):
+        return self.load().get('servers', {}).get(name)
+
+    def list_servers(self):
+        return self.load().get('servers', {})
+
+    def get_jump_host(self):
+        return self.load().get('jump_host', {})
+
+
+# ── State ─────────────────────────────────────────────────────────────────────
+
+class StateManager:
+    def load(self):
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def save(self, server_name):
+        data = {'active_server': server_name, 'set_at': datetime.now().isoformat()}
+        tmp = STATE_FILE.with_suffix('.tmp')
+        with open(tmp, 'w') as f:
+            json.dump(data, f)
+        tmp.rename(STATE_FILE)
+
+    def get_active(self):
+        return self.load().get('active_server')
+
+
+# ── Tunnel ────────────────────────────────────────────────────────────────────
+
+class TunnelManager:
+    def __init__(self, server_config, jump_host):
+        self.box_ip    = server_config['ip']
+        self.box_user  = server_config.get('user', 'wti')
+        self.db_host   = server_config['db_creds']['host']
+        self.db_port   = server_config['db_creds'].get('port', 1433)
+        self.bastion   = f"{jump_host['user']}@{jump_host['ip']}"
+        self.local_port = None
+        self._proc     = None
+
+    def _find_free_port(self):
+        with socket.socket() as s:
+            s.bind(('', 0))
+            return s.getsockname()[1]
+
+    def start(self):
+        self.local_port = self._find_free_port()
+        target = f"{self.box_user}@{self.box_ip}"
+        forward = f"{self.local_port}:{self.db_host}:{self.db_port}"
+
+        cmd = [
+            'ssh',
+            '-L', forward,
+            '-J', self.bastion,
+            target,
+            '-N',
+            '-o', 'ExitOnForwardFailure=yes',
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'UserKnownHostsFile=/dev/null',
+            '-o', 'LogLevel=ERROR',
+        ]
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        logger.info(f"SSH tunnel started: localhost:{self.local_port} -> {self.db_host}:{self.db_port} via {self.box_ip}")
+        return self.local_port
+
+    def wait_ready(self, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            # Check tunnel process hasn't already died
+            if self._proc.poll() is not None:
+                stderr = self._proc.stderr.read().decode(errors='replace').strip()
+                raise RuntimeError(f"SSH tunnel exited early: {stderr}")
+            try:
+                with socket.create_connection(('127.0.0.1', self.local_port), timeout=0.5):
+                    return True
+            except (ConnectionRefusedError, OSError):
+                time.sleep(0.2)
+        raise RuntimeError(f"Tunnel not ready after {timeout}s")
+
+    def stop(self):
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+            logger.info("SSH tunnel stopped")
+        self._proc = None
+
+    def __enter__(self):
+        self.start()
+        self.wait_ready()
+        return self.local_port
+
+    def __exit__(self, *_):
+        self.stop()
+
+
+# ── Query Runner ──────────────────────────────────────────────────────────────
+
+class QueryRunner:
+    def __init__(self, creds, local_port):
+        self.creds = creds
+        self.port  = local_port
+
+    def run(self, sql, fmt='table', headers=True):
+        cmd = [
+            TSQL_BIN,
+            '-H', '127.0.0.1',
+            '-p', str(self.port),
+            '-U', self.creds['username'],
+            '-P', str(self.creds['password']),
+            '-D', self.creds['database'],
+            '-t', '\t',
+        ]
+        input_sql = sql.strip() + '\ngo\nexit\n'
+        result = subprocess.run(
+            cmd,
+            input=input_sql,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        logger.info(f"tsql exit={result.returncode} sql={sql[:80]}")
+        if result.returncode != 0 and not result.stdout.strip():
+            err = result.stderr.strip() or "tsql returned non-zero exit code"
+            raise RuntimeError(f"Query failed: {err}")
+
+        return self._format(result.stdout, fmt, headers)
+
+    # tsql startup lines that appear in stdout (not stderr)
+    _TSQL_NOISE = (
+        'locale is ',
+        'locale charset is ',
+        'using default charset ',
+    )
+
+    def _parse_rows(self, raw):
+        """Parse tsql tab-delimited output into (header_row, data_rows)."""
+        lines = raw.splitlines()
+        rows = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if 'row' in stripped.lower() and 'affected' in stripped.lower():
+                continue
+            if any(stripped.lower().startswith(p) for p in self._TSQL_NOISE):
+                continue
+            # Strip leading tsql prompts ("1> 2> " etc.) — they appear on the
+            # same line as the first result row when SQL is piped via stdin
+            content = re.sub(r'^(\s*\d+>\s*)+', '', stripped)
+            if not content:
+                continue
+            rows.append(content.split('\t'))
+
+        if not rows:
+            return [], []
+
+        header = rows[0]
+        # Second row is often all dashes (separator) — skip it
+        data_start = 1
+        if len(rows) > 1 and all(set(c.strip()) <= {'-', ''} for c in rows[1]):
+            data_start = 2
+
+        return header, rows[data_start:]
+
+    def _format(self, raw, fmt, headers):
+        header, data = self._parse_rows(raw)
+        if not header:
+            return "(no results)"
+
+        if fmt == 'tsv':
+            lines = []
+            if headers:
+                lines.append('\t'.join(header))
+            for row in data:
+                lines.append('\t'.join(row))
+            return '\n'.join(lines)
+
+        if fmt == 'json':
+            import json as _json
+            result = []
+            for row in data:
+                obj = {}
+                for i, col in enumerate(header):
+                    obj[col.strip()] = row[i].strip() if i < len(row) else None
+                result.append(obj)
+            return _json.dumps(result, indent=2)
+
+        # table format (default)
+        all_rows = [header] + data
+        col_count = max(len(r) for r in all_rows)
+        widths = [0] * col_count
+        for row in all_rows:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell.strip()))
+
+        def fmt_row(row):
+            cells = []
+            for i in range(col_count):
+                val = row[i].strip() if i < len(row) else ''
+                cells.append(val.ljust(widths[i]))
+            return '  '.join(cells)
+
+        sep = '  '.join('-' * w for w in widths)
+        lines = []
+        if headers:
+            lines.append(fmt_row(header))
+            lines.append(sep)
+        for row in data:
+            lines.append(fmt_row(row))
+        return '\n'.join(lines)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def resolve_server(args_db, cm, state):
+    """Return (server_name, server_config) or exit with error."""
+    name = args_db or state.get_active()
+    if not name:
+        print("❌ No active server. Run: sqlrun use <name>")
+        print("   Or specify: sqlrun query --db <name> \"<SQL>\"")
+        sys.exit(1)
+    server = cm.get_server(name)
+    if not server:
+        print(f"❌ Server '{name}' not found in databases.yaml")
+        sys.exit(1)
+    creds = server.get('db_creds', {})
+    if not creds.get('host'):
+        print(f"❌ SQL Server host missing for '{name}'.")
+        print(f"   Run: python3 dbfetch fetch {name}")
+        sys.exit(1)
+    return name, server
+
+
+def parse_query_args(args):
+    """Parse args for `query` command. Returns (sql, db_name, fmt, headers, file)."""
+    db_name  = None
+    fmt      = 'table'
+    headers  = True
+    sql_file = None
+    remaining = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == '--db' and i + 1 < len(args):
+            db_name = args[i + 1]; i += 2
+        elif a == '--format' and i + 1 < len(args):
+            fmt = args[i + 1]; i += 2
+        elif a == '--no-headers':
+            headers = False; i += 1
+        elif a == '-f' and i + 1 < len(args):
+            sql_file = args[i + 1]; i += 2
+        else:
+            remaining.append(a); i += 1
+
+    sql = ' '.join(remaining) if remaining else None
+    return sql, db_name, fmt, headers, sql_file
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_use(args):
+    if not args:
+        print("Usage: sqlrun use <server-name>")
+        return 1
+    name = args[0]
+    cm = ConfigManager()
+    server = cm.get_server(name)
+    if not server:
+        print(f"❌ Server '{name}' not found in databases.yaml")
+        print(f"   Run: sqlrun list")
+        return 1
+    StateManager().save(name)
+    creds = server.get('db_creds', {})
+    db = creds.get('database', '?')
+    host = creds.get('host', '(host missing — run dbfetch fetch)')
+    print(f"✅ Active server set to: {name}")
+    print(f"   Database : {db}")
+    print(f"   SQL host : {host}:{creds.get('port', 1433)}")
+    print(f"   Box IP   : {server['ip']}")
+    return 0
+
+
+def cmd_status(args):
+    cm    = ConfigManager()
+    state = StateManager()
+    name  = state.get_active()
+    if not name:
+        print("No active server. Run: sqlrun use <name>")
+        return 0
+    server = cm.get_server(name)
+    if not server:
+        print(f"Active server '{name}' no longer in databases.yaml")
+        return 1
+    creds = server.get('db_creds', {})
+    host_ok = "✅" if creds.get('host') else "❌ (run dbfetch fetch)"
+    print(f"\nActive server : {name}")
+    print(f"  Box IP      : {server['ip']}")
+    print(f"  Database    : {creds.get('database', '?')}")
+    print(f"  SQL host    : {creds.get('host', 'missing')}:{creds.get('port', 1433)}  {host_ok}")
+    print(f"  Username    : {creds.get('username', '?')}")
+    info = state.load()
+    if info.get('set_at'):
+        print(f"  Set at      : {info['set_at'][:19]}")
+    print()
+    return 0
+
+
+def cmd_list(args):
+    cm      = ConfigManager()
+    servers = cm.list_servers()
+    active  = StateManager().get_active()
+    if not servers:
+        print("No servers in databases.yaml")
+        return 0
+
+    print(f"\n{'Name':<28} {'Box IP':<16} {'Database':<22} {'Host OK':<8} {'Active'}")
+    print('─' * 90)
+    for name, s in servers.items():
+        creds   = s.get('db_creds', {})
+        db      = creds.get('database', '—')
+        host_ok = '✅' if creds.get('host') else '❌'
+        marker  = '◀' if name == active else ''
+        print(f"{name:<28} {s['ip']:<16} {db:<22} {host_ok:<8} {marker}")
+    print()
+    return 0
+
+
+def cmd_query(args):
+    sql, db_name, fmt, headers, sql_file = parse_query_args(args)
+
+    # Read SQL from file or stdin if not provided as argument
+    if sql_file:
+        try:
+            sql = Path(sql_file).read_text()
+        except FileNotFoundError:
+            print(f"❌ File not found: {sql_file}")
+            return 1
+    elif not sql:
+        if not sys.stdin.isatty():
+            sql = sys.stdin.read()
+        else:
+            print("❌ No SQL provided. Usage: sqlrun query \"<SQL>\" or pipe via stdin")
+            return 1
+
+    cm     = ConfigManager()
+    state  = StateManager()
+    name, server = resolve_server(db_name, cm, state)
+    creds  = server['db_creds']
+    jh     = cm.get_jump_host()
+
+    print(f"🔗 Connecting to {name} ({creds['database']})...", file=sys.stderr)
+    tunnel = TunnelManager(server, jh)
+    atexit.register(tunnel.stop)
+
+    try:
+        port = tunnel.start()
+        tunnel.wait_ready()
+        runner = QueryRunner(creds, port)
+        output = runner.run(sql, fmt=fmt, headers=headers)
+        print(output)
+        return 0
+    except RuntimeError as e:
+        print(f"❌ {e}")
+        logger.error(str(e))
+        return 1
+    finally:
+        tunnel.stop()
+
+
+def cmd_shell(args):
+    db_name = args[0] if args else None
+    cm      = ConfigManager()
+    state   = StateManager()
+    name, server = resolve_server(db_name, cm, state)
+    creds   = server['db_creds']
+    jh      = cm.get_jump_host()
+
+    print(f"🔗 Opening shell: {name} ({creds['database']})")
+    print(f"   Type SQL and end with ; or 'go'. Type 'exit' or Ctrl-D to quit.\n")
+
+    tunnel = TunnelManager(server, jh)
+    atexit.register(tunnel.stop)
+
+    def _cleanup(sig=None, frame=None):
+        tunnel.stop()
+        sys.exit(0)
+    signal.signal(signal.SIGINT, _cleanup)
+    signal.signal(signal.SIGTERM, _cleanup)
+
+    try:
+        port = tunnel.start()
+        tunnel.wait_ready()
+        runner  = QueryRunner(creds, port)
+        prompt  = f"[{name} | {creds['database']}]> "
+        buf     = []
+
+        while True:
+            try:
+                line = input(prompt if not buf else '... ')
+            except EOFError:
+                print()
+                break
+
+            stripped = line.strip()
+            if not buf and stripped.lower() in ('exit', 'quit', '\\q'):
+                break
+
+            buf.append(line)
+            execute = (
+                stripped.endswith(';') or
+                stripped.lower() == 'go'
+            )
+            if execute:
+                sql = '\n'.join(buf).rstrip(';').strip()
+                buf = []
+                if not sql:
+                    continue
+                try:
+                    output = runner.run(sql, fmt='table', headers=True)
+                    print(output)
+                except RuntimeError as e:
+                    print(f"❌ {e}")
+                print()
+
+        # Run any buffered SQL on exit
+        if buf:
+            sql = '\n'.join(buf).strip()
+            if sql:
+                try:
+                    print(runner.run(sql, fmt='table', headers=True))
+                except RuntimeError as e:
+                    print(f"❌ {e}")
+
+    finally:
+        tunnel.stop()
+
+    return 0
+
+
+def print_usage():
+    print("""
+sqlrun — SQL Query Tool
+
+Usage:
+  sqlrun use <name>                   Set active server (persists across sessions)
+  sqlrun status                       Show active server info
+  sqlrun list                         List all servers and their status
+  sqlrun query "<SQL>"                Run query against active server
+  sqlrun query --db <name> "<SQL>"    One-off query without changing active server
+  sqlrun query -f <file.sql>          Run SQL from a file
+  sqlrun shell [<name>]               Open interactive SQL shell
+  sqlrun help                         Show this help
+
+Query flags:
+  --format table    Aligned table output (default)
+  --format tsv      Tab-separated (for agents/scripts)
+  --format json     JSON array
+  --no-headers      Omit column headers
+
+Examples:
+  sqlrun use tallgrass-project
+  sqlrun query "SELECT TOP 5 name FROM sys.tables"
+  sqlrun query --format tsv "SELECT * FROM users"
+  sqlrun query --db targa-project "SELECT @@VERSION"
+  echo "SELECT @@SERVERNAME" | sqlrun query
+  sqlrun shell
+    """)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print_usage()
+        return 1
+
+    command = sys.argv[1].lower()
+    args    = sys.argv[2:]
+
+    commands = {
+        'use':    cmd_use,
+        'status': cmd_status,
+        'list':   cmd_list,
+        'query':  cmd_query,
+        'shell':  cmd_shell,
+        'help':   lambda x: (print_usage(), 0)[1],
+    }
+
+    if command not in commands:
+        print(f"Unknown command: {command}")
+        print_usage()
+        return 1
+
+    try:
+        return commands[command](args)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 1
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        print(f"❌ Unexpected error: {e}")
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

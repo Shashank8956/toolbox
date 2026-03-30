@@ -9,4 +9,11 @@ servers:
     rails_directory: "/srv/www/apps/revenue_accounting"
     db_creds_fetched: false
     last_fetched: null
-    db_creds: {}
+    db_creds:
+      environment: production
+      adapter: sqlserver
+      host: "172.x.x.x"       # SQL Server IP (populated by dbfetch)
+      port: 1433
+      database: my_database
+      username: my_user
+      password: my_password

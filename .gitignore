@@ -1,0 +1,6 @@
+machines.yaml
+*.log
+.processed_machines
+__pycache__/
+*.pyc
+.DS_Store

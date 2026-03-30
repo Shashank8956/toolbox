@@ -1,0 +1,45 @@
+jump_host:
+  user: "wti"
+  ip: "your.bastion.ip"
+
+# Absolute path to the local erp workspace (parent of all submodule dirs)
+local_root: "/Users/yourname/code/wes/erp"
+
+# Base path on the remote servers where all repos live
+remote_root: "/srv/www/apps"
+
+# Repos to watch by default when none specified in 'rdev start'
+default_repos:
+  - revenue_accounting
+  - go-ra
+
+repos:
+  revenue_accounting:
+    local_path: revenue_accounting      # relative to local_root
+    remote_path: revenue_accounting     # relative to remote_root
+    build:
+      cmd: "assets && touch tmp/restart.txt"
+      post_cmd: "wgod start && wgod status"
+
+  go-ra:
+    local_path: go-ra
+    remote_path: go-ra
+    build:
+      cmd: "~/bin/build"
+
+  erp_ui:
+    local_path: erp_ui
+    remote_path: erp_ui
+    build:
+      cmd: "npm run build"
+
+  etl:
+    local_path: etl
+    remote_path: etl
+    build:
+      cmd: "bundle exec rake"
+
+  whb:
+    local_path: whb
+    remote_path: whb
+    # build.cmd not set yet — fill in when needed

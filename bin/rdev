@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+"""
+rdev — Remote Dev Sync Tool
+Watches local repo files and instantly syncs changes to a remote staging server.
+Select a server once, save files locally, build remotely — feels like working local.
+"""
+
+import sys
+import os
+import json
+import signal
+import socket
+import logging
+import tempfile
+import subprocess
+import yaml
+from pathlib import Path
+from datetime import datetime
+
+SCRIPT_DIR  = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+CONFIG_FILE = PROJECT_DIR / "config" / "rdev.yaml"
+MACHINES_FILE = PROJECT_DIR / "config" / "machines.yaml"
+STATE_FILE  = Path.home() / ".rdev_state"
+LOG_FILE    = PROJECT_DIR / "logs" / "rdev.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.FileHandler(LOG_FILE)]
+)
+logger = logging.getLogger(__name__)
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+class ConfigManager:
+    def load(self):
+        if not CONFIG_FILE.exists():
+            print(f"❌ rdev.yaml not found at {CONFIG_FILE}")
+            print(f"   Copy config/rdev.yaml.example to config/rdev.yaml and fill in your values.")
+            sys.exit(1)
+        with open(CONFIG_FILE) as f:
+            return yaml.safe_load(f)
+
+    def get_repo(self, name):
+        cfg = self.load()
+        repos = cfg.get('repos', {})
+        if name not in repos:
+            print(f"❌ Repo '{name}' not found in rdev.yaml. Available: {', '.join(repos)}")
+            sys.exit(1)
+        return repos[name]
+
+    def list_repos(self):
+        return self.load().get('repos', {})
+
+    def default_repos(self):
+        return self.load().get('default_repos', [])
+
+    def jump_host(self):
+        cfg = self.load()
+        jh = cfg['jump_host']
+        return f"{jh['user']}@{jh['ip']}"
+
+    def local_root(self):
+        return Path(self.load()['local_root'])
+
+    def remote_root(self):
+        return self.load()['remote_root']
+
+
+class MachinesManager:
+    def load(self):
+        if not MACHINES_FILE.exists():
+            print(f"❌ machines.yaml not found at {MACHINES_FILE}")
+            sys.exit(1)
+        with open(MACHINES_FILE) as f:
+            return yaml.safe_load(f)
+
+    def get_server(self, name):
+        machines = self.load().get('machines', {})
+        if name not in machines:
+            available = ', '.join(machines.keys())
+            print(f"❌ Server '{name}' not found in machines.yaml.")
+            print(f"   Available: {available}")
+            sys.exit(1)
+        return machines[name]
+
+    def list_servers(self):
+        return self.load().get('machines', {})
+
+
+# ── State ─────────────────────────────────────────────────────────────────────
+
+class StateManager:
+    def load(self):
+        if not STATE_FILE.exists():
+            return {}
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def save(self, data):
+        tmp = STATE_FILE.with_suffix('.tmp')
+        with open(tmp, 'w') as f:
+            json.dump(data, f, indent=2)
+        tmp.rename(STATE_FILE)
+
+    def update(self, **kwargs):
+        state = self.load()
+        state.update(kwargs)
+        self.save(state)
+
+    def clear(self):
+        if STATE_FILE.exists():
+            STATE_FILE.unlink()
+
+    def require(self):
+        """Load state or exit with a helpful error if no session is active."""
+        state = self.load()
+        if not state.get('server'):
+            print("❌ No active session. Start one with: rdev start <server>")
+            sys.exit(1)
+        return state
+
+
+# ── Daemon (background watcher) ───────────────────────────────────────────────
+
+def _check_fswatch():
+    result = subprocess.run(['which', 'fswatch'], capture_output=True)
+    if result.returncode != 0:
+        print("❌ fswatch is not installed.")
+        print("   Install it with: brew install fswatch")
+        sys.exit(1)
+
+
+def _sync_file(changed_path, local_root, remote_root, repos, server_user, server_ip, bastion):
+    """Rsync a single changed file to its corresponding remote path."""
+    changed = Path(changed_path)
+    for repo_name, repo in repos.items():
+        local_repo = local_root / repo['local_path']
+        if str(changed).startswith(str(local_repo) + '/') or changed == local_repo:
+            try:
+                rel = changed.relative_to(local_repo)
+            except ValueError:
+                continue
+            remote_dir = f"{remote_root}/{repo['remote_path']}/{rel.parent}"
+            if remote_dir.endswith('/.'):
+                remote_dir = remote_dir[:-2]
+            cmd = [
+                'rsync', '-az',
+                '--exclude=.git/',
+                '--exclude=__pycache__/',
+                '--exclude=*.pyc',
+                '--exclude=node_modules/',
+                '--exclude=tmp/',
+                '--exclude=log/',
+                '-e', f"ssh -J {bastion} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
+                str(changed),
+                f"{server_user}@{server_ip}:{remote_dir}/"
+            ]
+            result = subprocess.run(cmd, capture_output=True)
+            if result.returncode == 0:
+                logger.info(f"Synced: {repo_name}/{rel} → {server_ip}:{remote_dir}/")
+            else:
+                logger.error(f"rsync failed for {changed}: {result.stderr.decode()}")
+            return
+    logger.debug(f"Ignored (not in watched repos): {changed_path}")
+
+
+def _run_daemon(server_name, repo_names):
+    """The actual daemon loop. Called as a hidden subcommand."""
+    cm = ConfigManager()
+    mm = MachinesManager()
+
+    cfg = cm.load()
+    local_root = Path(cfg['local_root'])
+    remote_root = cfg['remote_root']
+    bastion = cm.jump_host()
+    repos = {r: cm.get_repo(r) for r in repo_names}
+
+    server = mm.get_server(server_name)
+    server_ip   = server['ip']
+    server_user = server.get('user', 'wti')
+
+    watch_paths = [str(local_root / r['local_path']) for r in repos.values()]
+
+    fswatch_cmd = [
+        'fswatch',
+        '--exclude=\\.git',
+        '--exclude=__pycache__',
+        '--exclude=\\.pyc$',
+        '--exclude=node_modules',
+        '--exclude=/tmp/',
+        '--exclude=/log/',
+    ] + watch_paths
+
+    logger.info(f"Daemon started: watching {repo_names} → {server_name} ({server_ip})")
+
+    proc = subprocess.Popen(fswatch_cmd, stdout=subprocess.PIPE)
+
+    def shutdown(sig, frame):
+        proc.terminate()
+        logger.info("Daemon stopped")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    # fswatch outputs one file path per line — readline() unblocks on each event
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            break
+        changed = line.decode('utf-8', errors='replace').strip()
+        if changed:
+            _sync_file(changed, local_root, remote_root, repos, server_user, server_ip, bastion)
+
+
+# ── SSH helpers ───────────────────────────────────────────────────────────────
+
+def _ssh_base(server_ip, server_user, bastion):
+    return [
+        'ssh',
+        '-o', f'ProxyJump={bastion}',
+        '-o', 'StrictHostKeyChecking=no',
+        '-o', 'UserKnownHostsFile=/dev/null',
+        '-o', 'LogLevel=ERROR',
+        f'{server_user}@{server_ip}',
+    ]
+
+
+def _ssh_stream(server_ip, server_user, bastion, remote_cmd):
+    """Run a command on remote and stream its output live. Returns exit code."""
+    cmd = _ssh_base(server_ip, server_user, bastion) + ['-t', remote_cmd]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        for line in iter(proc.stdout.readline, b''):
+            print(line.decode('utf-8', errors='replace'), end='', flush=True)
+    except KeyboardInterrupt:
+        proc.terminate()
+    proc.wait()
+    return proc.returncode
+
+
+def _is_pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_start(args):
+    """Start a sync session: rdev start <server> [repo ...]"""
+    if not args:
+        print("Error: Usage: rdev start <server> [repo ...]")
+        return 1
+
+    _check_fswatch()
+
+    server_name = args[0]
+    cm = ConfigManager()
+    mm = MachinesManager()
+
+    repo_names = args[1:] if len(args) > 1 else cm.default_repos()
+    if not repo_names:
+        print("❌ No repos specified and no default_repos set in rdev.yaml")
+        return 1
+
+    # Validate all repos exist
+    for r in repo_names:
+        cm.get_repo(r)  # exits if not found
+
+    # Validate server exists
+    server = mm.get_server(server_name)
+
+    # Check if a daemon is already running
+    sm = StateManager()
+    old = sm.load()
+    if old.get('daemon_pid') and _is_pid_alive(old['daemon_pid']):
+        print(f"⚠️  A watcher is already running (PID {old['daemon_pid']}) for {old.get('server')}.")
+        print(f"   Run 'rdev stop' first to switch servers.")
+        return 1
+
+    # Save session state
+    sm.save({
+        'server': server_name,
+        'server_ip': server['ip'],
+        'server_user': server.get('user', 'wti'),
+        'watching': repo_names,
+        'daemon_pid': None,
+        'started_at': datetime.now().isoformat(),
+    })
+
+    # Spawn background daemon (self-fork)
+    log_fd = open(LOG_FILE, 'a')
+    proc = subprocess.Popen(
+        [sys.argv[0], '_daemon', server_name] + repo_names,
+        stdout=log_fd,
+        stderr=log_fd,
+        start_new_session=True,
+    )
+    log_fd.close()
+    sm.update(daemon_pid=proc.pid)
+
+    print(f"✅ Session started")
+    print(f"   Server : {server_name} ({server['ip']})")
+    print(f"   Watching: {', '.join(repo_names)}")
+    print(f"   Daemon  : PID {proc.pid}")
+    print(f"   Logs    : rdev logs")
+    return 0
+
+
+def cmd_stop(args):
+    """Stop the active sync session."""
+    sm = StateManager()
+    state = sm.load()
+    pid = state.get('daemon_pid')
+
+    if not pid:
+        print("No active session.")
+        sm.clear()
+        return 0
+
+    if _is_pid_alive(pid):
+        os.kill(pid, signal.SIGTERM)
+        print(f"✅ Stopped daemon (PID {pid})")
+    else:
+        print(f"Daemon PID {pid} was already gone.")
+
+    sm.clear()
+    return 0
+
+
+def cmd_status(args):
+    """Show active session status."""
+    sm = StateManager()
+    state = sm.load()
+
+    if not state.get('server'):
+        print("No active session. Start one with: rdev start <server>")
+        return 0
+
+    pid = state.get('daemon_pid')
+    alive = pid and _is_pid_alive(pid)
+
+    print()
+    print(f"  Server   : {state['server']} ({state.get('server_ip', '?')})")
+    print(f"  Watching : {', '.join(state.get('watching', []))}")
+    print(f"  Daemon   : PID {pid} {'✅ running' if alive else '❌ dead — run: rdev start ' + state['server']}")
+    print(f"  Started  : {state.get('started_at', '?')}")
+    print()
+    return 0
+
+
+def cmd_build(args):
+    """Run remote build: rdev build [repo]"""
+    sm = StateManager()
+    state = sm.require()
+    cm = ConfigManager()
+
+    repo_name = args[0] if args else state['watching'][0]
+    repo = cm.get_repo(repo_name)
+
+    build = repo.get('build', {})
+    build_cmd = build.get('cmd')
+    if not build_cmd:
+        print(f"❌ No build.cmd configured for repo '{repo_name}' in rdev.yaml")
+        return 1
+
+    remote_root = cm.remote_root()
+    remote_dir = f"{remote_root}/{repo['remote_path']}"
+    bastion = cm.jump_host()
+
+    print(f"\n🔨 Building {repo_name} on {state['server']}...")
+    print(f"   Command: {build_cmd}")
+    print(f"   Dir    : {remote_dir}")
+    print("─" * 60)
+
+    rc = _ssh_stream(
+        state['server_ip'], state['server_user'], bastion,
+        f"cd {remote_dir} && {build_cmd}"
+    )
+
+    print("─" * 60)
+
+    post_cmd = build.get('post_cmd')
+    if post_cmd and rc == 0:
+        print(f"\n🔁 Running post-build: {post_cmd}")
+        print("─" * 60)
+        rc = _ssh_stream(
+            state['server_ip'], state['server_user'], bastion,
+            f"cd {remote_dir} && {post_cmd}"
+        )
+        print("─" * 60)
+
+    if rc == 0:
+        print(f"\n✅ Build finished successfully")
+    else:
+        print(f"\n❌ Build exited with code {rc}")
+    return rc
+
+
+def cmd_git(args):
+    """Run a git command locally and mirror it on the remote for each watched repo."""
+    if not args:
+        print("Error: Usage: rdev git <git-args>")
+        return 1
+
+    sm = StateManager()
+    state = sm.require()
+    cm = ConfigManager()
+
+    local_root = cm.local_root()
+    remote_root = cm.remote_root()
+    bastion = cm.jump_host()
+
+    # Run locally in erp root
+    print(f"\n[local] git {' '.join(args)}")
+    result = subprocess.run(['git'] + args, cwd=str(local_root))
+    if result.returncode != 0:
+        return result.returncode
+
+    # If it was a checkout, also update submodules locally
+    if args[0] == 'checkout':
+        subprocess.run(['git', 'submodule', 'update', '--init', '--recursive'], cwd=str(local_root))
+
+    # Mirror on remote for each watched repo
+    for repo_name in state['watching']:
+        repo = cm.get_repo(repo_name)
+        remote_dir = f"{remote_root}/{repo['remote_path']}"
+        print(f"\n[remote:{repo_name}] git {' '.join(args)}")
+        subprocess.run(
+            _ssh_base(state['server_ip'], state['server_user'], bastion) +
+            [f"cd {remote_dir} && git {' '.join(args)}"]
+        )
+
+    return 0
+
+
+def cmd_exec(args):
+    """Run an arbitrary command on the active remote server."""
+    if not args:
+        print("Error: Usage: rdev exec <command>")
+        return 1
+
+    sm = StateManager()
+    state = sm.require()
+    cm = ConfigManager()
+
+    remote_cmd = ' '.join(args)
+    bastion = cm.jump_host()
+
+    print(f"[{state['server']}] {remote_cmd}")
+    return _ssh_stream(state['server_ip'], state['server_user'], bastion, remote_cmd)
+
+
+def cmd_list(args):
+    """List servers and configured repos."""
+    cm = ConfigManager()
+    mm = MachinesManager()
+    sm = StateManager()
+    state = sm.load()
+    active = state.get('server')
+
+    print("\n── Servers (from machines.yaml) " + "─" * 40)
+    servers = mm.list_servers()
+    for name, details in servers.items():
+        marker = " ← active" if name == active else ""
+        print(f"  {name:<25} {details['ip']}{marker}")
+
+    print("\n── Repos (from rdev.yaml) " + "─" * 46)
+    repos = cm.list_repos()
+    defaults = cm.default_repos()
+    for name, repo in repos.items():
+        default_marker = " [default]" if name in defaults else ""
+        build_cmd = repo.get('build', {}).get('cmd', '—')
+        print(f"  {name:<25} build: {build_cmd}{default_marker}")
+    print()
+    return 0
+
+
+def cmd_logs(args):
+    """Tail recent sync log entries."""
+    if not LOG_FILE.exists():
+        print("No logs yet.")
+        return 0
+    with open(LOG_FILE) as f:
+        lines = f.readlines()
+    n = int(args[0]) if args else 50
+    print(''.join(lines[-n:]))
+    return 0
+
+
+def print_usage():
+    print("""
+rdev — Remote Dev Sync Tool
+
+Usage:
+  rdev start <server> [repo ...]   Start sync session (default repos from config)
+  rdev stop                        Stop active session and watcher daemon
+  rdev status                      Show session info and daemon health
+  rdev build [repo]                Run remote build, stream output live
+  rdev git <git-args>              Run git cmd locally + mirror on remote repos
+  rdev exec <cmd>                  Run any command on remote, stream output
+  rdev list                        List servers and configured repos
+  rdev logs [n]                    Show last n sync log entries (default 50)
+  rdev help                        Show this help
+
+Examples:
+  rdev start tallgrass-project
+  rdev start tallgrass-project go-ra
+  rdev build go-ra
+  rdev build revenue_accounting
+  rdev git checkout main
+  rdev exec "ps aux | grep wgod"
+  rdev stop
+    """)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print_usage()
+        return 1
+
+    command = sys.argv[1]
+    args = sys.argv[2:]
+
+    # Hidden internal subcommand: the daemon itself
+    if command == '_daemon':
+        if len(args) < 2:
+            print("Internal use only: _daemon <server> <repo> [repo ...]")
+            return 1
+        _run_daemon(server_name=args[0], repo_names=args[1:])
+        return 0
+
+    commands = {
+        'start':  cmd_start,
+        'stop':   cmd_stop,
+        'status': cmd_status,
+        'build':  cmd_build,
+        'git':    cmd_git,
+        'exec':   cmd_exec,
+        'list':   cmd_list,
+        'logs':   cmd_logs,
+        'help':   lambda x: (print_usage(), 0)[1],
+    }
+
+    if command not in commands:
+        print(f"Unknown command: {command}")
+        print_usage()
+        return 1
+
+    try:
+        return commands[command](args)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 1
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        print(f"❌ Error: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

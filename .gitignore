@@ -1,7 +1,10 @@
-machines.yaml
-databases.yaml
+config/machines.yaml
+config/databases.yaml
+config/rdev.yaml
+logs/*.log
 *.log
 .processed_machines
 __pycache__/
+**/__pycache__/
 *.pyc
 .DS_Store

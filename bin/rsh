@@ -16,10 +16,11 @@ import fcntl
 import logging
 
 # Resolve symlink to get the actual script location
-SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = SCRIPT_DIR / "machines.yaml"
-LOG_FILE = SCRIPT_DIR / "rsh.log"
-LOCK_FILE = SCRIPT_DIR / ".rsh.lock"
+SCRIPT_DIR  = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+CONFIG_FILE = PROJECT_DIR / "config" / "machines.yaml"
+LOG_FILE    = PROJECT_DIR / "logs" / "rsh.log"
+LOCK_FILE   = PROJECT_DIR / "logs" / ".rsh.lock"
 
 # Setup logging
 logging.basicConfig(

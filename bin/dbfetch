@@ -12,9 +12,10 @@ import logging
 from pathlib import Path
 from datetime import datetime
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = SCRIPT_DIR / "databases.yaml"
-LOG_FILE = SCRIPT_DIR / "dbfetch.log"
+SCRIPT_DIR  = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+CONFIG_FILE = PROJECT_DIR / "config" / "databases.yaml"
+LOG_FILE    = PROJECT_DIR / "logs" / "dbfetch.log"
 
 logging.basicConfig(
     level=logging.INFO,

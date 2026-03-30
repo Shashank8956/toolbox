@@ -2,6 +2,31 @@
 
 A growing collection of personal productivity and infrastructure automation tools.
 
+## Project Structure
+
+```
+toolbox/
+├── bin/          # Executables — add this to PATH
+│   ├── rsh
+│   ├── dbfetch
+│   ├── sqlrun
+│   └── rdev
+├── config/       # YAML configs (real configs gitignored, .example files committed)
+│   ├── machines.yaml.example
+│   ├── databases.yaml.example
+│   └── rdev.yaml.example
+├── logs/         # Runtime logs (gitignored)
+├── archive/      # Old / one-time scripts kept for reference
+└── README.md
+```
+
+**Setup:** Add `bin/` to your PATH in `~/.zshrc`:
+```bash
+export PATH="$PATH:/path/to/toolbox/bin"
+```
+
+---
+
 ## Tools
 
 ### rsh — Remote Setup Helper
@@ -23,7 +48,7 @@ rsh logs                # Show recent operation logs
 #### How setup works
 
 When you run `rsh add`:
-1. Saves the machine to `machines.yaml`
+1. Saves the machine to `config/machines.yaml`
 2. Copies your SSH public key via `ssh-copy-id` through the jump host
 3. SSHs into the machine and navigates to the configured directory
 4. Backs up and merges user data into the target YAML file
@@ -32,7 +57,7 @@ When you run `rsh add`:
 
 #### Configuration
 
-Copy `machines.yaml.example` to `machines.yaml` and fill in your values:
+Copy `config/machines.yaml.example` to `config/machines.yaml` and fill in your values:
 
 ```yaml
 jump_host:
@@ -52,17 +77,10 @@ setup_config:
   post_edit_command: "your_provisioning_command"
 ```
 
-#### Related tools
-
-- **`machine_setup_monitor.py`** — Background daemon that watches `machines.yaml` for new entries and automatically triggers setup.
-- **`notes_monitor.py`** — Monitors a macOS Notes entry in real-time (reads the Notes SQLite DB). Handy for tracking dynamically updated IPs or notes.
-- **`restore_backup.sh`** — Interactive script to restore `users.yaml.bak` backups on remote machines.
-
 #### Requirements
 
 - Python 3
 - `sshpass` (for password-based SSH auth): `brew install sshpass`
-- SSH access to your bastion/jump host
 
 ---
 
@@ -85,7 +103,7 @@ dbfetch logs                          # Show recent logs
 
 #### Configuration
 
-Copy `databases.yaml.example` to `databases.yaml` and fill in your values:
+Copy `config/databases.yaml.example` to `config/databases.yaml`:
 
 ```yaml
 jump_host:
@@ -99,7 +117,7 @@ servers:
     rails_directory: "/srv/www/apps/revenue_accounting"
 ```
 
-> `databases.yaml` is gitignored — it will contain real credentials.
+> `config/databases.yaml` is gitignored — it will contain real credentials.
 
 ---
 
@@ -133,33 +151,111 @@ sqlrun query --no-headers "<SQL>"    # Omit column headers
 #### Example workflow
 
 ```bash
-# Pick your DB
 sqlrun use tallgrass-project
-
-# Query freely
 sqlrun query "SELECT TOP 10 * FROM users"
-
-# Pipe SQL in
 echo "SELECT @@VERSION" | sqlrun query
-
-# One-off on a different DB without changing active
 sqlrun query --db targa-project "SELECT COUNT(*) FROM jobs"
-
-# Interactive shell
 sqlrun shell
 ```
 
 #### How it works
 
-1. Reads credentials from `databases.yaml` (populated by `dbfetch`)
+1. Reads credentials from `config/databases.yaml` (populated by `dbfetch`)
 2. Opens an SSH tunnel through the bastion to the SQL Server
-3. Runs `tsql` locally against the tunnel
-4. Tears down the tunnel on exit
+3. Runs `tsql` locally against the tunnel — tears down tunnel on exit
 
 #### Requirements
 
 - `tsql` (freetds): `brew install freetds`
-- Credentials fetched via `dbfetch fetch --all`
+- Credentials fetched first via `dbfetch fetch --all`
+
+---
+
+### rdev — Remote Dev Sync Tool
+
+Watches local code files and instantly syncs changes to a remote staging server. Run builds remotely with live output. Feels like working locally.
+
+**Use case:** You edit code in `/Users/you/code/wes/erp` locally. Every file save is instantly copied to the active remote server. Type `rdev build go-ra` and the remote build streams back to your terminal.
+
+#### Commands
+
+```bash
+rdev start <server> [repo ...]   # Start sync session (default: revenue_accounting + go-ra)
+rdev stop                        # Stop the sync daemon
+rdev status                      # Show session info and daemon health
+rdev build [repo]                # Run remote build, stream output live
+rdev git <git-args>              # Run git cmd locally + mirror on remote repos
+rdev exec <cmd>                  # Run any command on remote, stream output
+rdev list                        # List servers and configured repos
+rdev logs [n]                    # Show last n sync entries (default 50)
+```
+
+#### Example workflow
+
+```bash
+# Start watching tallgrass-project (syncs revenue_accounting + go-ra by default)
+rdev start tallgrass-project
+
+# Or watch a specific repo
+rdev start tallgrass-project go-ra
+
+# Save any file locally → it instantly appears on remote
+
+# Run a build (streams live output)
+rdev build go-ra
+rdev build revenue_accounting    # runs assets + restart + wgod
+
+# Switch branches everywhere at once
+rdev git checkout main
+
+# Run a one-off remote command
+rdev exec "ps aux | grep wgod"
+
+# Stop when done
+rdev stop
+```
+
+#### How it works
+
+1. `rdev start` spawns a background daemon that runs `fswatch` on your local repo dirs
+2. On every file save, `rsync` sends just that file to the remote via SSH (ProxyJump bastion)
+3. `rdev build` SSHes in with a pseudo-TTY and runs the repo's configured build command
+4. Build output streams line-by-line to your terminal in real time
+
+#### Configuration
+
+Copy `config/rdev.yaml.example` to `config/rdev.yaml`:
+
+```yaml
+jump_host:
+  user: "wti"
+  ip: "your.bastion.ip"
+
+local_root: "/Users/you/code/wes/erp"
+remote_root: "/srv/www/apps"
+
+default_repos:
+  - revenue_accounting
+  - go-ra
+
+repos:
+  revenue_accounting:
+    local_path: revenue_accounting
+    remote_path: revenue_accounting
+    build:
+      cmd: "assets && touch tmp/restart.txt"
+      post_cmd: "wgod start && wgod status"
+  go-ra:
+    local_path: go-ra
+    remote_path: go-ra
+    build:
+      cmd: "~/bin/build"
+```
+
+#### Requirements
+
+- `fswatch`: `brew install fswatch`
+- SSH access through bastion (same setup as `rsh`)
 
 ---
 

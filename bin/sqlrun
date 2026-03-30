@@ -21,9 +21,10 @@ from pathlib import Path
 from datetime import datetime
 
 SCRIPT_DIR  = Path(__file__).resolve().parent
-CONFIG_FILE = SCRIPT_DIR / "databases.yaml"
+PROJECT_DIR = SCRIPT_DIR.parent
+CONFIG_FILE = PROJECT_DIR / "config" / "databases.yaml"
 STATE_FILE  = Path.home() / ".sqlrun_state"
-LOG_FILE    = SCRIPT_DIR / "sqlrun.log"
+LOG_FILE    = PROJECT_DIR / "logs" / "sqlrun.log"
 TSQL_BIN    = "/opt/homebrew/bin/tsql"
 
 logging.basicConfig(

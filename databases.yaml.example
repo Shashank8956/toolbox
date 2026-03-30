@@ -1,0 +1,12 @@
+jump_host:
+  user: "your_user"
+  ip: "your.bastion.ip"
+
+servers:
+  my-staging-server:
+    ip: "172.100.x.x"
+    user: "wti"
+    rails_directory: "/srv/www/apps/revenue_accounting"
+    db_creds_fetched: false
+    last_fetched: null
+    db_creds: {}

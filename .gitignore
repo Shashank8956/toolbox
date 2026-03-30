@@ -1,4 +1,5 @@
 machines.yaml
+databases.yaml
 *.log
 .processed_machines
 __pycache__/

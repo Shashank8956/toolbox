@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""
+dbfetch — DB Credentials Fetcher
+SSHes into remote staging servers, reads database.yml, and saves extracted creds locally.
+"""
+
+import sys
+import yaml
+import os
+import subprocess
+import logging
+from pathlib import Path
+from datetime import datetime
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_FILE = SCRIPT_DIR / "databases.yaml"
+LOG_FILE = SCRIPT_DIR / "dbfetch.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class ConfigManager:
+    def __init__(self, config_file):
+        self.config_file = Path(config_file)
+
+    def load(self):
+        if not self.config_file.exists():
+            logger.error(f"Config file not found: {self.config_file}")
+            logger.error(f"Copy databases.yaml.example to databases.yaml and fill in your values.")
+            sys.exit(1)
+        with open(self.config_file, 'r') as f:
+            return yaml.safe_load(f)
+
+    def save(self, config):
+        with open(self.config_file, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    def add_server(self, name, ip, user="wti", rails_directory=None):
+        config = self.load()
+        if 'servers' not in config:
+            config['servers'] = {}
+
+        for sname, details in config['servers'].items():
+            if details['ip'] == ip:
+                logger.warning(f"Server with IP {ip} already exists as '{sname}'")
+                return False, sname
+
+        config['servers'][name] = {
+            'ip': ip,
+            'user': user,
+            'rails_directory': rails_directory or config.get('defaults', {}).get('rails_directory', '/srv/www/apps/revenue_accounting'),
+            'db_creds_fetched': False,
+            'last_fetched': None,
+            'db_creds': {}
+        }
+        self.save(config)
+        logger.info(f"Added server: {name} ({ip})")
+        return True, name
+
+    def get_server(self, name):
+        config = self.load()
+        return config.get('servers', {}).get(name)
+
+    def list_servers(self):
+        config = self.load()
+        return config.get('servers', {})
+
+    def save_creds(self, name, creds):
+        config = self.load()
+        if name not in config.get('servers', {}):
+            logger.error(f"Server '{name}' not found in config")
+            return False
+        config['servers'][name]['db_creds'] = creds
+        config['servers'][name]['db_creds_fetched'] = True
+        config['servers'][name]['last_fetched'] = datetime.now().isoformat()
+        self.save(config)
+        logger.info(f"Saved DB creds for {name}")
+        return True
+
+
+class CredFetcher:
+    def __init__(self, config_manager):
+        self.cm = config_manager
+        self.config = self.cm.load()
+
+    def fetch(self, server_name):
+        server = self.cm.get_server(server_name)
+        if not server:
+            logger.error(f"Server '{server_name}' not found")
+            return False
+
+        jump_host = self.config['jump_host']
+        proxy_jump = f"{jump_host['user']}@{jump_host['ip']}"
+        target = f"{server['user']}@{server['ip']}"
+        rails_dir = server['rails_directory']
+        db_yml_path = f"{rails_dir}/config/database.yml"
+
+        print(f"\n🔗 Connecting to {server_name} ({server['ip']})...")
+        logger.info(f"Fetching DB creds from {server_name} ({server['ip']})")
+
+        remote_cmd = f"""
+echo "STEP:CONNECTED"
+if [ ! -f {db_yml_path} ]; then
+    echo "STEP:FILE_NOT_FOUND"
+    exit 1
+fi
+echo "STEP:FILE_FOUND"
+echo "DB_YML_START"
+cat {db_yml_path}
+echo "DB_YML_END"
+echo "STEP:DONE"
+"""
+
+        cmd = [
+            'ssh',
+            '-o', f'ProxyJump={proxy_jump}',
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'UserKnownHostsFile=/dev/null',
+            '-o', 'LogLevel=ERROR',
+            target,
+            f'bash <<\'EOF\'\n{remote_cmd}\nEOF\n'
+        ]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            output = result.stdout
+            logger.info(f"Raw output from {server_name}:\n{output}")
+
+            if "STEP:CONNECTED" not in output:
+                print(f"❌ Could not connect to {server_name}")
+                logger.error(f"SSH connection failed: {result.stderr}")
+                return False
+
+            print(f"✅ Connected")
+
+            if "STEP:FILE_NOT_FOUND" in output:
+                print(f"❌ database.yml not found at {db_yml_path}")
+                logger.error(f"database.yml not found at {db_yml_path}")
+                return False
+
+            print(f"✅ Found database.yml")
+
+            # Extract the raw database.yml content
+            raw_db_yml = self._extract_between(output, "DB_YML_START", "DB_YML_END")
+            if not raw_db_yml:
+                print(f"❌ Failed to read database.yml content")
+                return False
+
+            # Parse and extract creds
+            creds = self._parse_db_yml(raw_db_yml, server_name)
+            if not creds:
+                print(f"❌ Could not parse credentials from database.yml")
+                return False
+
+            # Save to config
+            self.cm.save_creds(server_name, creds)
+
+            print(f"\n✅ Credentials saved for {server_name}:")
+            self._print_creds(creds)
+            return True
+
+        except subprocess.TimeoutExpired:
+            print(f"❌ Connection to {server_name} timed out")
+            logger.error(f"Timeout fetching creds from {server_name}")
+            return False
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            logger.error(f"Error fetching creds from {server_name}: {e}", exc_info=True)
+            return False
+
+    def _extract_between(self, text, start_marker, end_marker):
+        """Extract text between two marker strings."""
+        try:
+            start = text.index(start_marker) + len(start_marker)
+            end = text.index(end_marker, start)
+            return text[start:end].strip()
+        except ValueError:
+            return None
+
+    def _parse_db_yml(self, raw_yaml, server_name):
+        """Parse database.yml and extract production/staging credentials."""
+        try:
+            db_config = yaml.safe_load(raw_yaml)
+        except yaml.YAMLError as e:
+            logger.error(f"Failed to parse database.yml YAML: {e}")
+            return None
+
+        if not db_config or not isinstance(db_config, dict):
+            logger.error("database.yml is empty or not a valid YAML dict")
+            return None
+
+        # Priority order for environment keys to extract
+        env_priority = ['production', 'staging', 'development']
+        chosen_env = None
+        chosen_config = None
+
+        for env in env_priority:
+            if env in db_config and isinstance(db_config[env], dict):
+                chosen_env = env
+                chosen_config = db_config[env]
+                break
+
+        # If none of the above, just take the first dict entry
+        if not chosen_config:
+            for key, val in db_config.items():
+                if isinstance(val, dict):
+                    chosen_env = key
+                    chosen_config = val
+                    break
+
+        if not chosen_config:
+            logger.error("No usable environment block found in database.yml")
+            return None
+
+        print(f"📋 Extracting '{chosen_env}' credentials...")
+        logger.info(f"Using '{chosen_env}' block from database.yml for {server_name}")
+
+        creds = {
+            'environment': chosen_env,
+            'adapter':  chosen_config.get('adapter'),
+            'host':     chosen_config.get('host'),
+            'port':     chosen_config.get('port'),
+            'database': chosen_config.get('database'),
+            'username': chosen_config.get('username'),
+            'password': chosen_config.get('password'),
+        }
+
+        # Strip None values
+        creds = {k: v for k, v in creds.items() if v is not None}
+        return creds
+
+    def _print_creds(self, creds):
+        width = 40
+        print(f"{'─'*width}")
+        for key, val in creds.items():
+            if key == 'password':
+                display = '*' * len(str(val))
+            else:
+                display = val
+            print(f"  {key:<12}: {display}")
+        print(f"{'─'*width}")
+
+
+def print_usage():
+    print("""
+dbfetch — DB Credentials Fetcher
+
+Usage:
+  dbfetch add <name> <ip> [rails_dir]   Add a staging server
+  dbfetch fetch <name>                  Fetch & save DB creds from a server
+  dbfetch fetch --all                   Fetch creds from all servers
+  dbfetch list                          List servers and cred status
+  dbfetch show <name>                   Show saved creds for a server
+  dbfetch logs                          Show recent logs
+  dbfetch help                          Show this help
+
+Examples:
+  dbfetch add tallgrass 172.100.11.54
+  dbfetch add targa 172.100.9.88 /srv/www/apps/other_app
+  dbfetch fetch tallgrass
+  dbfetch fetch --all
+  dbfetch show tallgrass
+    """)
+
+
+def cmd_add(args):
+    if len(args) < 2:
+        print("Error: Usage: dbfetch add <name> <ip> [rails_dir]")
+        return 1
+    name = args[0]
+    ip = args[1]
+    rails_dir = args[2] if len(args) > 2 else None
+
+    cm = ConfigManager(CONFIG_FILE)
+    added, existing = cm.add_server(name, ip, rails_directory=rails_dir)
+    if not added:
+        print(f"Server with IP {ip} already exists as '{existing}'")
+        return 1
+    print(f"✅ Added server: {name} ({ip})")
+    return 0
+
+
+def cmd_fetch(args):
+    if not args:
+        print("Error: Usage: dbfetch fetch <name> | --all")
+        return 1
+
+    cm = ConfigManager(CONFIG_FILE)
+    fetcher = CredFetcher(cm)
+
+    if args[0] == '--all':
+        servers = cm.list_servers()
+        if not servers:
+            print("No servers configured.")
+            return 0
+        results = {}
+        for name in servers:
+            print(f"\n{'='*50}")
+            print(f"Fetching: {name}")
+            results[name] = fetcher.fetch(name)
+        print(f"\n{'='*50}")
+        print("Summary:")
+        for name, ok in results.items():
+            status = "✅" if ok else "❌"
+            print(f"  {status} {name}")
+        return 0 if all(results.values()) else 1
+    else:
+        name = args[0]
+        return 0 if fetcher.fetch(name) else 1
+
+
+def cmd_list(args):
+    cm = ConfigManager(CONFIG_FILE)
+    servers = cm.list_servers()
+    if not servers:
+        print("No servers configured. Add one with: dbfetch add <name> <ip>")
+        return 0
+
+    print("\n" + "="*75)
+    print(f"{'Name':<22} {'IP':<18} {'Creds':<10} {'Last Fetched'}")
+    print("="*75)
+    for name, details in servers.items():
+        fetched = "✅ Saved" if details.get('db_creds_fetched') else "⏳ Pending"
+        last = details.get('last_fetched') or 'Never'
+        if last and last != 'Never':
+            last = last.split('T')[0]
+        print(f"{name:<22} {details['ip']:<18} {fetched:<10} {last}")
+    print("="*75 + "\n")
+    return 0
+
+
+def cmd_show(args):
+    if not args:
+        print("Error: Usage: dbfetch show <name>")
+        return 1
+
+    name = args[0]
+    cm = ConfigManager(CONFIG_FILE)
+    server = cm.get_server(name)
+
+    if not server:
+        print(f"Server '{name}' not found.")
+        return 1
+
+    creds = server.get('db_creds', {})
+    if not creds:
+        print(f"No credentials saved for '{name}'. Run: dbfetch fetch {name}")
+        return 1
+
+    print(f"\nDB credentials for {name} ({server['ip']}):")
+    width = 40
+    print(f"{'─'*width}")
+    for key, val in creds.items():
+        if key == 'password':
+            display = '*' * len(str(val))
+        else:
+            display = val
+        print(f"  {key:<12}: {display}")
+    print(f"{'─'*width}\n")
+    return 0
+
+
+def cmd_logs(args):
+    if not LOG_FILE.exists():
+        print("No logs yet.")
+        return 0
+    with open(LOG_FILE, 'r') as f:
+        lines = f.readlines()
+    print(''.join(lines[-50:]))
+    return 0
+
+
+def main():
+    if len(sys.argv) < 2:
+        print_usage()
+        return 1
+
+    command = sys.argv[1].lower()
+    args = sys.argv[2:]
+
+    commands = {
+        'add':   cmd_add,
+        'fetch': cmd_fetch,
+        'list':  cmd_list,
+        'show':  cmd_show,
+        'logs':  cmd_logs,
+        'help':  lambda x: (print_usage(), 0)[1],
+    }
+
+    if command not in commands:
+        print(f"Unknown command: {command}")
+        print_usage()
+        return 1
+
+    try:
+        return commands[command](args)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 1
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

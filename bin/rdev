@@ -548,9 +548,70 @@ def cmd_list(args):
 
 
 def cmd_logs(args):
-    """Tail recent sync log entries."""
+    """Tail remote app log files.
+
+    rdev logs                     tail -f all *.log (real-time)
+    rdev logs <file>              tail -f specific file (real-time)
+    rdev logs -n <N>              last N lines from all *.log (static)
+    rdev logs <file> -n <N>       last N lines from specific file (static)
+    """
+    sm = StateManager()
+    state = sm.require()
+    cm = ConfigManager()
+    bastion = cm.jump_host()
+
+    # Parse args: optional filename, optional -n N
+    filename = None
+    tail_n = None
+    i = 0
+    while i < len(args):
+        if args[i] == '-n' and i + 1 < len(args):
+            tail_n = int(args[i + 1])
+            i += 2
+        elif not args[i].startswith('-'):
+            filename = args[i]
+            i += 1
+        else:
+            i += 1
+
+    # Find the repo with a log_dir configured, default to first watched repo
+    repo_name = None
+    repo = None
+    for r in state.get('watching', []):
+        cfg_repo = cm.get_repo(r)
+        if cfg_repo.get('log_dir'):
+            repo_name = r
+            repo = cfg_repo
+            break
+    if not repo:
+        # Fall back to first watched repo with default log_dir 'log'
+        repo_name = state['watching'][0]
+        repo = cm.get_repo(repo_name)
+
+    remote_dir = state.get('resolved_paths', {}).get(repo_name)
+    if not remote_dir:
+        remote_root = cm.remote_root()
+        rp = repo['remote_path']
+        remote_dir = rp if rp.startswith('/') else f"{remote_root}/{rp}"
+
+    log_dir = repo.get('log_dir', 'log')
+    log_path = f"{remote_dir}/{log_dir}"
+    target = f"{log_path}/{filename}" if filename else f"{log_path}/*.log"
+
+    if tail_n is not None:
+        print(f"[{state['server']}] tail -n {tail_n} {target}")
+        return _ssh_stream(state['server_ip'], state['server_user'], bastion,
+                           f"bash -c 'tail -n {tail_n} {target}'")
+    else:
+        print(f"[{state['server']}] tail -f {target}  (Ctrl+C to stop)")
+        return _ssh_stream(state['server_ip'], state['server_user'], bastion,
+                           f"bash -c 'tail -f {target}'")
+
+
+def cmd_sync_logs(args):
+    """Show local rdev daemon sync log entries."""
     if not LOG_FILE.exists():
-        print("No logs yet.")
+        print("No sync logs yet.")
         return 0
     with open(LOG_FILE) as f:
         lines = f.readlines()
@@ -572,7 +633,11 @@ Usage:
   rdev wgod [status|start|restart] Run wgod on active server (default: status)
   rdev exec <cmd>                  Run any command on remote, stream output
   rdev list                        List servers and configured repos
-  rdev logs [n]                    Show last n sync log entries (default 50)
+  rdev logs                        Tail all *.log on remote in real-time
+  rdev logs <file>                 Tail specific log file in real-time
+  rdev logs -n <N>                 Show last N lines from all *.log
+  rdev logs <file> -n <N>          Show last N lines from specific file
+  rdev sync-logs [n]               Show local rdev daemon log (default 50 lines)
   rdev help                        Show this help
 
 Examples:
@@ -580,6 +645,10 @@ Examples:
   rdev start tallgrass-project go-ra
   rdev build go-ra
   rdev build revenue_accounting
+  rdev logs
+  rdev logs production.log
+  rdev logs -n 100
+  rdev logs production.log -n 50
   rdev git checkout main
   rdev exec "ps aux | grep wgod"
   rdev stop
@@ -611,7 +680,8 @@ def main():
         'wgod':   cmd_wgod,
         'exec':   cmd_exec,
         'list':   cmd_list,
-        'logs':   cmd_logs,
+        'logs':      cmd_logs,
+        'sync-logs': cmd_sync_logs,
         'help':   lambda x: (print_usage(), 0)[1],
     }
 

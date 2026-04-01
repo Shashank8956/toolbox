@@ -17,6 +17,7 @@ repos:
   revenue_accounting:
     local_path: revenue_accounting      # relative to local_root
     remote_path: revenue_accounting     # relative to remote_root
+    log_dir: log                        # relative to remote repo path — used by `rdev logs`
     build:
       cmd: "assets && touch tmp/restart.txt"
       post_cmd: "wgod start && wgod status"

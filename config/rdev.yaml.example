@@ -8,6 +8,19 @@ local_root: "/Users/yourname/code/wes/erp"
 # Base path on the remote servers where all repos live
 remote_root: "/srv/www/apps"
 
+# Repos to create branches in for `rdev branch` and `rdev raise-pr`
+branch_repos:
+  - revenue_accounting
+  - go-ra
+
+# Known branch suffixes → origin branch mapping for `rdev branch`
+# Unknown suffixes are appended to origin/release/ automatically
+# Update the release versions each sprint
+branch_targets:
+  dmt: origin/develop-mt
+  24: origin/release/24.2.18.1.m
+  25: origin/release/25.0.0.1.m
+
 # Repos to watch by default when none specified in 'rdev start'
 default_repos:
   - revenue_accounting

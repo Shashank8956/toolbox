@@ -488,6 +488,214 @@ def cmd_git(args):
     return 0
 
 
+def cmd_branch(args):
+    """Create local branches for a ticket across repos.
+
+    rdev branch WEMAIN-XXXXX 24 25 dmt [other ...]
+
+    Suffixes resolve to origin branches via branch_targets in rdev.yaml.
+    Unknown suffixes are appended to origin/release/.
+    Repos come from branch_repos in rdev.yaml (or --repos override).
+    """
+    if len(args) < 2:
+        print("Error: Usage: rdev branch <TICKET> <suffix> [suffix ...] [--repos r1,r2]")
+        return 1
+
+    cm = ConfigManager()
+    cfg = cm.load()
+
+    ticket = args[0]
+    rest = args[1:]
+
+    # Parse optional --repos override
+    repo_names = None
+    if '--repos' in rest:
+        idx = rest.index('--repos')
+        repo_names = rest[idx + 1].split(',')
+        rest = rest[:idx] + rest[idx + 2:]
+
+    suffixes = rest
+    if not suffixes:
+        print("Error: Specify at least one branch suffix (e.g. 24 25 dmt)")
+        return 1
+
+    if repo_names is None:
+        repo_names = cfg.get('branch_repos', list(cfg.get('repos', {}).keys()))
+
+    targets = cfg.get('branch_targets', {})
+    local_root = Path(cfg['local_root'])
+
+    failed = False
+    for suffix in suffixes:
+        branch_name = f"{ticket}--{suffix}x" if not suffix.endswith('x') and suffix not in targets else f"{ticket}--{suffix}"
+        # For named targets like dmt, don't append x
+        if suffix in targets:
+            branch_name = f"{ticket}--{suffix}"
+            origin_branch = targets[suffix]
+        elif suffix.rstrip('x').isdigit():
+            branch_name = f"{ticket}--{suffix}x"
+            origin_branch = f"origin/release/{suffix}"
+        else:
+            branch_name = f"{ticket}--{suffix}"
+            origin_branch = f"origin/release/{suffix}"
+
+        print(f"\n── {branch_name} → {origin_branch} " + "─" * 30)
+        for repo_name in repo_names:
+            repo_dir = local_root / cfg['repos'][repo_name]['local_path']
+            print(f"  [{repo_name}] git checkout -b {branch_name} {origin_branch}")
+            result = subprocess.run(
+                ['git', 'checkout', '-b', branch_name, origin_branch],
+                cwd=str(repo_dir), capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                # Pull to ensure up to date
+                subprocess.run(['git', 'pull'], cwd=str(repo_dir),
+                               capture_output=True)
+                print(f"  ✅ {repo_name}: branch created and up to date")
+            else:
+                print(f"  ❌ {repo_name}: {result.stderr.strip()}")
+                failed = True
+
+    return 1 if failed else 0
+
+
+def cmd_raise_pr(args):
+    """Cherry-pick current branch commits to all sibling ticket branches and raise PRs.
+
+    rdev raise-pr "Commit message"
+
+    Detects the current branch (must match TICKET--SUFFIX pattern), finds all
+    sibling branches for the same ticket, cherry-picks commits, pushes, and
+    opens a PR for each via `gh pr create`.
+    """
+    if not args:
+        print("Error: Usage: rdev raise-pr \"Commit message\"")
+        return 1
+
+    commit_msg = args[0]
+    cm = ConfigManager()
+    cfg = cm.load()
+    local_root = Path(cfg['local_root'])
+    repo_names = cfg.get('branch_repos', list(cfg.get('repos', {}).keys()))
+
+    # Detect current branch from first branch_repo
+    first_repo_dir = local_root / cfg['repos'][repo_names[0]]['local_path']
+    result = subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                            cwd=str(first_repo_dir), capture_output=True, text=True)
+    current_branch = result.stdout.strip()
+
+    # Parse ticket and suffix from branch name (WEMAIN-XXXXX--suffix)
+    if '--' not in current_branch:
+        print(f"❌ Current branch '{current_branch}' doesn't match TICKET--SUFFIX format")
+        return 1
+
+    ticket = current_branch.rsplit('--', 1)[0]
+    targets = cfg.get('branch_targets', {})
+
+    # Find all sibling branches for this ticket across all repos
+    # Collect from git branch -a output of first repo
+    result = subprocess.run(['git', 'branch', '--list', f"{ticket}--*"],
+                            cwd=str(first_repo_dir), capture_output=True, text=True)
+    all_branches = [b.strip().lstrip('* ') for b in result.stdout.splitlines()]
+    sibling_branches = [b for b in all_branches if b != current_branch]
+
+    if not sibling_branches:
+        print(f"No sibling branches found for {ticket}. Raising PR only for current branch.")
+
+    failed = False
+    all_branches_ordered = [current_branch] + sibling_branches
+
+    for branch in all_branches_ordered:
+        is_current = (branch == current_branch)
+        print(f"\n── {'[current] ' if is_current else ''}PR for {branch} " + "─" * 30)
+
+        for repo_name in repo_names:
+            repo_dir = local_root / cfg['repos'][repo_name]['local_path']
+
+            if not is_current:
+                # Check if this branch exists in this repo
+                check = subprocess.run(['git', 'rev-parse', '--verify', branch],
+                                       cwd=str(repo_dir), capture_output=True)
+                if check.returncode != 0:
+                    print(f"  [{repo_name}] branch {branch} not found, skipping")
+                    continue
+
+                # Get commits on current branch not on the origin of target branch
+                suffix = branch.rsplit('--', 1)[1]
+                if suffix.rstrip('x') in [k.rstrip('x') for k in targets] or suffix in targets:
+                    origin_branch = targets.get(suffix, targets.get(suffix.rstrip('x'), f"origin/release/{suffix}"))
+                else:
+                    origin_branch = f"origin/release/{suffix}"
+
+                # Get commits from current branch to cherry-pick
+                src_result = subprocess.run(
+                    ['git', 'log', '--pretty=format:%H', f"{origin_branch}..{current_branch}"],
+                    cwd=str(repo_dir), capture_output=True, text=True
+                )
+                commits = src_result.stdout.strip().split('\n')
+                commits = [c for c in commits if c]
+                if not commits:
+                    print(f"  [{repo_name}] no commits to cherry-pick")
+                    continue
+
+                print(f"  [{repo_name}] checking out {branch}")
+                subprocess.run(['git', 'checkout', branch], cwd=str(repo_dir), capture_output=True)
+
+                print(f"  [{repo_name}] cherry-picking {len(commits)} commit(s)")
+                for sha in reversed(commits):
+                    cp = subprocess.run(['git', 'cherry-pick', sha],
+                                        cwd=str(repo_dir), capture_output=True, text=True)
+                    if cp.returncode != 0:
+                        print(f"  ❌ [{repo_name}] cherry-pick {sha[:8]} failed: {cp.stderr.strip()}")
+                        print(f"     Resolve conflicts then run: git cherry-pick --continue")
+                        failed = True
+                        break
+            else:
+                # Commit any staged/unstaged changes on current branch
+                subprocess.run(['git', 'add', '-A'], cwd=str(repo_dir), capture_output=True)
+                commit_result = subprocess.run(['git', 'commit', '-m', commit_msg],
+                                               cwd=str(repo_dir), capture_output=True, text=True)
+                if commit_result.returncode != 0 and 'nothing to commit' not in commit_result.stdout:
+                    print(f"  ❌ [{repo_name}] commit failed: {commit_result.stderr.strip()}")
+                    failed = True
+                    continue
+                print(f"  [{repo_name}] committed")
+
+            # Push
+            print(f"  [{repo_name}] pushing {branch}")
+            push = subprocess.run(['git', 'push', '-u', 'origin', branch],
+                                  cwd=str(repo_dir), capture_output=True, text=True)
+            if push.returncode != 0:
+                print(f"  ❌ [{repo_name}] push failed: {push.stderr.strip()}")
+                failed = True
+                continue
+            print(f"  ✅ [{repo_name}] pushed")
+
+            # Raise PR via gh
+            suffix = branch.rsplit('--', 1)[1]
+            base_branch = None
+            if suffix in targets:
+                base_branch = targets[suffix].replace('origin/', '')
+            elif suffix.rstrip('x') in targets:
+                base_branch = targets[suffix.rstrip('x')].replace('origin/', '')
+            else:
+                base_branch = f"release/{suffix}"
+
+            pr = subprocess.run(
+                ['gh', 'pr', 'create', '--repo', f"waterfield/{repo_name}",
+                 '--title', commit_msg, '--body', '',
+                 '--base', base_branch, '--head', branch],
+                cwd=str(repo_dir), capture_output=True, text=True
+            )
+            if pr.returncode == 0:
+                print(f"  ✅ [{repo_name}] PR created: {pr.stdout.strip()}")
+            else:
+                print(f"  ❌ [{repo_name}] PR failed: {pr.stderr.strip()}")
+                failed = True
+
+    return 1 if failed else 0
+
+
 def cmd_wgod(args):
     """Run wgod status/start/restart on the active remote server."""
     subcmd = args[0] if args else 'status'
@@ -630,6 +838,8 @@ Usage:
   rdev status                      Show session info and daemon health
   rdev build [repo]                Run remote build, stream output live
   rdev git <git-args>              Run git cmd locally + mirror on remote repos
+  rdev branch <TICKET> <suffix...>  Create local branches across repos for a ticket
+  rdev raise-pr "Commit message"   Commit, cherry-pick to siblings, push and raise PRs
   rdev wgod [status|start|restart] Run wgod on active server (default: status)
   rdev exec <cmd>                  Run any command on remote, stream output
   rdev list                        List servers and configured repos
@@ -677,7 +887,9 @@ def main():
         'status': cmd_status,
         'build':  cmd_build,
         'git':    cmd_git,
-        'wgod':   cmd_wgod,
+        'branch':   cmd_branch,
+        'raise-pr': cmd_raise_pr,
+        'wgod':     cmd_wgod,
         'exec':   cmd_exec,
         'list':   cmd_list,
         'logs':      cmd_logs,

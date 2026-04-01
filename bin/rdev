@@ -146,7 +146,9 @@ def _sync_file(changed_path, local_root, remote_root, repos, server_user, server
                 rel = changed.relative_to(local_repo)
             except ValueError:
                 continue
-            remote_dir = f"{remote_root}/{repo['remote_path']}/{rel.parent}"
+            rp = repo['remote_path']
+            base = rp if rp.startswith('/') else f"{remote_root}/{rp}"
+            remote_dir = f"{base}/{rel.parent}"
             if remote_dir.endswith('/.'):
                 remote_dir = remote_dir[:-2]
             cmd = [
@@ -179,7 +181,13 @@ def _run_daemon(server_name, repo_names):
     local_root = Path(cfg['local_root'])
     remote_root = cfg['remote_root']
     bastion = cm.jump_host()
-    repos = {r: cm.get_repo(r) for r in repo_names}
+    repos = {r: dict(cm.get_repo(r)) for r in repo_names}
+
+    # Apply resolved paths from state (glob paths already expanded at session start)
+    resolved = StateManager().load().get('resolved_paths', {})
+    for r in repo_names:
+        if r in resolved:
+            repos[r]['remote_path'] = resolved[r]
 
     server = mm.get_server(server_name)
     server_ip   = server['ip']
@@ -253,6 +261,21 @@ def _is_pid_alive(pid):
         return False
 
 
+def _resolve_remote_path(server_ip, server_user, bastion, path):
+    """If path contains a glob (*), resolve it on the remote via SSH. Returns absolute path."""
+    if '*' not in path:
+        return path
+    result = subprocess.run(
+        _ssh_base(server_ip, server_user, bastion) + [f'ls -d {path} 2>/dev/null | head -1'],
+        capture_output=True, text=True
+    )
+    resolved = result.stdout.strip()
+    if not resolved:
+        print(f"❌ Could not resolve remote path glob: {path}")
+        sys.exit(1)
+    return resolved
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 def cmd_start(args):
@@ -278,6 +301,10 @@ def cmd_start(args):
 
     # Validate server exists
     server = mm.get_server(server_name)
+    server_ip   = server['ip']
+    server_user = server.get('user', 'wti')
+    bastion     = cm.jump_host()
+    remote_root = cm.remote_root()
 
     # Check if a daemon is already running
     sm = StateManager()
@@ -287,12 +314,24 @@ def cmd_start(args):
         print(f"   Run 'rdev stop' first to switch servers.")
         return 1
 
+    # Resolve remote paths (handles globs like /home/wti/go*/src/ra)
+    print(f"   Resolving remote paths on {server_name}...")
+    resolved_paths = {}
+    for r in repo_names:
+        repo = cm.get_repo(r)
+        rp = repo.get('remote_path', r)
+        full = rp if rp.startswith('/') else f"{remote_root}/{rp}"
+        resolved_paths[r] = _resolve_remote_path(server_ip, server_user, bastion, full)
+        if '*' in rp:
+            print(f"   {r}: {resolved_paths[r]}")
+
     # Save session state
     sm.save({
         'server': server_name,
-        'server_ip': server['ip'],
-        'server_user': server.get('user', 'wti'),
+        'server_ip': server_ip,
+        'server_user': server_user,
         'watching': repo_names,
+        'resolved_paths': resolved_paths,
         'daemon_pid': None,
         'started_at': datetime.now().isoformat(),
     })
@@ -373,8 +412,11 @@ def cmd_build(args):
         print(f"❌ No build.cmd configured for repo '{repo_name}' in rdev.yaml")
         return 1
 
-    remote_root = cm.remote_root()
-    remote_dir = f"{remote_root}/{repo['remote_path']}"
+    remote_dir = state.get('resolved_paths', {}).get(repo_name)
+    if not remote_dir:
+        remote_root = cm.remote_root()
+        rp = repo['remote_path']
+        remote_dir = rp if rp.startswith('/') else f"{remote_root}/{rp}"
     bastion = cm.jump_host()
 
     print(f"\n🔨 Building {repo_name} on {state['server']}...")
@@ -384,7 +426,7 @@ def cmd_build(args):
 
     rc = _ssh_stream(
         state['server_ip'], state['server_user'], bastion,
-        f"cd {remote_dir} && {build_cmd}"
+        f"bash -li -c 'cd {remote_dir} && {build_cmd}'"
     )
 
     print("─" * 60)
@@ -395,7 +437,7 @@ def cmd_build(args):
         print("─" * 60)
         rc = _ssh_stream(
             state['server_ip'], state['server_user'], bastion,
-            f"cd {remote_dir} && {post_cmd}"
+            f"bash -li -c 'cd {remote_dir} && {post_cmd}'"
         )
         print("─" * 60)
 
@@ -433,7 +475,10 @@ def cmd_git(args):
     # Mirror on remote for each watched repo
     for repo_name in state['watching']:
         repo = cm.get_repo(repo_name)
-        remote_dir = f"{remote_root}/{repo['remote_path']}"
+        remote_dir = state.get('resolved_paths', {}).get(repo_name)
+        if not remote_dir:
+            rp = repo['remote_path']
+            remote_dir = rp if rp.startswith('/') else f"{remote_root}/{rp}"
         print(f"\n[remote:{repo_name}] git {' '.join(args)}")
         subprocess.run(
             _ssh_base(state['server_ip'], state['server_user'], bastion) +
@@ -441,6 +486,23 @@ def cmd_git(args):
         )
 
     return 0
+
+
+def cmd_wgod(args):
+    """Run wgod status/start/restart on the active remote server."""
+    subcmd = args[0] if args else 'status'
+    if subcmd not in ('status', 'start', 'restart'):
+        print("Error: Usage: rdev wgod [status|start|restart]")
+        return 1
+
+    sm = StateManager()
+    state = sm.require()
+    cm = ConfigManager()
+    bastion = cm.jump_host()
+
+    print(f"[{state['server']}] wgod {subcmd}")
+    return _ssh_stream(state['server_ip'], state['server_user'], bastion,
+                       f"bash -li -c 'wgod {subcmd}'")
 
 
 def cmd_exec(args):
@@ -507,6 +569,7 @@ Usage:
   rdev status                      Show session info and daemon health
   rdev build [repo]                Run remote build, stream output live
   rdev git <git-args>              Run git cmd locally + mirror on remote repos
+  rdev wgod [status|start|restart] Run wgod on active server (default: status)
   rdev exec <cmd>                  Run any command on remote, stream output
   rdev list                        List servers and configured repos
   rdev logs [n]                    Show last n sync log entries (default 50)
@@ -545,6 +608,7 @@ def main():
         'status': cmd_status,
         'build':  cmd_build,
         'git':    cmd_git,
+        'wgod':   cmd_wgod,
         'exec':   cmd_exec,
         'list':   cmd_list,
         'logs':   cmd_logs,

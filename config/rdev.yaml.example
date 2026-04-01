@@ -23,7 +23,7 @@ repos:
 
   go-ra:
     local_path: go-ra
-    remote_path: go-ra
+    remote_path: /home/wti/go*/src/ra        # glob resolved at session start — handles version-specific paths
     build:
       cmd: "~/bin/build"
 

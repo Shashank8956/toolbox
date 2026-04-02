@@ -580,7 +580,7 @@ def cmd_branch(args):
                     if not remote_dir:
                         rp = repo_cfg['remote_path']
                         remote_dir = rp if rp.startswith('/') else f"{remote_root}/{rp}"
-                    remote_cmd = f"cd {remote_dir} && git checkout -b {branch_name} {origin_branch} 2>/dev/null || git checkout {branch_name} && git pull"
+                    remote_cmd = f"cd {remote_dir} && git fetch origin && (git checkout -b {branch_name} {origin_branch} 2>/dev/null || git checkout {branch_name}) && git pull"
                     print(f"  [{repo_name}] remote: git checkout -b {branch_name} {origin_branch}")
                     subprocess.run(
                         _ssh_base(state['server_ip'], state['server_user'], bastion) + [remote_cmd]

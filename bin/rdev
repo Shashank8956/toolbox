@@ -522,21 +522,16 @@ def cmd_branch(args):
     if repo_names is None:
         repo_names = cfg.get('branch_repos', list(cfg.get('repos', {}).keys()))
 
-    targets = cfg.get('branch_targets', {})
+    targets = {str(k): v for k, v in cfg.get('branch_targets', {}).items()}
     local_root = Path(cfg['local_root'])
 
     failed = False
     for suffix in suffixes:
-        branch_name = f"{ticket}--{suffix}x" if not suffix.endswith('x') and suffix not in targets else f"{ticket}--{suffix}"
-        # For named targets like dmt, don't append x
+        is_numeric = suffix.rstrip('x').isdigit()
+        branch_name = f"{ticket}--{suffix}x" if is_numeric else f"{ticket}--{suffix}"
         if suffix in targets:
-            branch_name = f"{ticket}--{suffix}"
             origin_branch = targets[suffix]
-        elif suffix.rstrip('x').isdigit():
-            branch_name = f"{ticket}--{suffix}x"
-            origin_branch = f"origin/release/{suffix}"
         else:
-            branch_name = f"{ticket}--{suffix}"
             origin_branch = f"origin/release/{suffix}"
 
         print(f"\n── {branch_name} → {origin_branch} " + "─" * 30)
@@ -548,10 +543,9 @@ def cmd_branch(args):
                 cwd=str(repo_dir), capture_output=True, text=True
             )
             if result.returncode == 0:
-                # Pull to ensure up to date
-                subprocess.run(['git', 'pull'], cwd=str(repo_dir),
-                               capture_output=True)
-                print(f"  ✅ {repo_name}: branch created and up to date")
+                print(f"  [{repo_name}] git pull")
+                subprocess.run(['git', 'pull'], cwd=str(repo_dir))
+                print(f"  ✅ {repo_name}: done")
             else:
                 print(f"  ❌ {repo_name}: {result.stderr.strip()}")
                 failed = True
@@ -576,122 +570,128 @@ def cmd_raise_pr(args):
     cm = ConfigManager()
     cfg = cm.load()
     local_root = Path(cfg['local_root'])
-    repo_names = cfg.get('branch_repos', list(cfg.get('repos', {}).keys()))
+    targets = {str(k): v for k, v in cfg.get('branch_targets', {}).items()}
 
-    # Detect current branch from first branch_repo
-    first_repo_dir = local_root / cfg['repos'][repo_names[0]]['local_path']
+    # Detect which repo we're in from cwd
+    cwd = Path.cwd()
+    repo_name = None
+    repo_dir = None
+    for name, repo in cfg.get('repos', {}).items():
+        candidate = local_root / repo['local_path']
+        try:
+            cwd.relative_to(candidate)
+            repo_name = name
+            repo_dir = candidate
+            break
+        except ValueError:
+            continue
+    if not repo_name:
+        print(f"❌ Not inside a known repo. cwd: {cwd}")
+        print(f"   Known repos: {', '.join(cfg.get('repos', {}).keys())}")
+        return 1
+
+    # Detect current branch
     result = subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-                            cwd=str(first_repo_dir), capture_output=True, text=True)
+                            cwd=str(repo_dir), capture_output=True, text=True)
     current_branch = result.stdout.strip()
 
-    # Parse ticket and suffix from branch name (WEMAIN-XXXXX--suffix)
     if '--' not in current_branch:
         print(f"❌ Current branch '{current_branch}' doesn't match TICKET--SUFFIX format")
         return 1
 
     ticket = current_branch.rsplit('--', 1)[0]
-    targets = cfg.get('branch_targets', {})
 
-    # Find all sibling branches for this ticket across all repos
-    # Collect from git branch -a output of first repo
+    # Find all sibling branches in this repo
     result = subprocess.run(['git', 'branch', '--list', f"{ticket}--*"],
-                            cwd=str(first_repo_dir), capture_output=True, text=True)
-    all_branches = [b.strip().lstrip('* ') for b in result.stdout.splitlines()]
+                            cwd=str(repo_dir), capture_output=True, text=True)
+    all_branches = [b.strip().lstrip('* ') for b in result.stdout.splitlines() if b.strip()]
     sibling_branches = [b for b in all_branches if b != current_branch]
 
     if not sibling_branches:
         print(f"No sibling branches found for {ticket}. Raising PR only for current branch.")
 
-    failed = False
-    all_branches_ordered = [current_branch] + sibling_branches
+    print(f"  Repo    : {repo_name}")
+    print(f"  Branches: {', '.join([current_branch] + sibling_branches)}")
 
-    for branch in all_branches_ordered:
+    failed = False
+    pr_links = []
+
+    for branch in [current_branch] + sibling_branches:
         is_current = (branch == current_branch)
         print(f"\n── {'[current] ' if is_current else ''}PR for {branch} " + "─" * 30)
 
-        for repo_name in repo_names:
-            repo_dir = local_root / cfg['repos'][repo_name]['local_path']
-
-            if not is_current:
-                # Check if this branch exists in this repo
-                check = subprocess.run(['git', 'rev-parse', '--verify', branch],
-                                       cwd=str(repo_dir), capture_output=True)
-                if check.returncode != 0:
-                    print(f"  [{repo_name}] branch {branch} not found, skipping")
-                    continue
-
-                # Get commits on current branch not on the origin of target branch
-                suffix = branch.rsplit('--', 1)[1]
-                if suffix.rstrip('x') in [k.rstrip('x') for k in targets] or suffix in targets:
-                    origin_branch = targets.get(suffix, targets.get(suffix.rstrip('x'), f"origin/release/{suffix}"))
-                else:
-                    origin_branch = f"origin/release/{suffix}"
-
-                # Get commits from current branch to cherry-pick
-                src_result = subprocess.run(
-                    ['git', 'log', '--pretty=format:%H', f"{origin_branch}..{current_branch}"],
-                    cwd=str(repo_dir), capture_output=True, text=True
-                )
-                commits = src_result.stdout.strip().split('\n')
-                commits = [c for c in commits if c]
-                if not commits:
-                    print(f"  [{repo_name}] no commits to cherry-pick")
-                    continue
-
-                print(f"  [{repo_name}] checking out {branch}")
-                subprocess.run(['git', 'checkout', branch], cwd=str(repo_dir), capture_output=True)
-
-                print(f"  [{repo_name}] cherry-picking {len(commits)} commit(s)")
-                for sha in reversed(commits):
-                    cp = subprocess.run(['git', 'cherry-pick', sha],
-                                        cwd=str(repo_dir), capture_output=True, text=True)
-                    if cp.returncode != 0:
-                        print(f"  ❌ [{repo_name}] cherry-pick {sha[:8]} failed: {cp.stderr.strip()}")
-                        print(f"     Resolve conflicts then run: git cherry-pick --continue")
-                        failed = True
-                        break
-            else:
-                # Commit any staged/unstaged changes on current branch
-                subprocess.run(['git', 'add', '-A'], cwd=str(repo_dir), capture_output=True)
-                commit_result = subprocess.run(['git', 'commit', '-m', commit_msg],
-                                               cwd=str(repo_dir), capture_output=True, text=True)
-                if commit_result.returncode != 0 and 'nothing to commit' not in commit_result.stdout:
-                    print(f"  ❌ [{repo_name}] commit failed: {commit_result.stderr.strip()}")
-                    failed = True
-                    continue
-                print(f"  [{repo_name}] committed")
-
-            # Push
-            print(f"  [{repo_name}] pushing {branch}")
-            push = subprocess.run(['git', 'push', '-u', 'origin', branch],
-                                  cwd=str(repo_dir), capture_output=True, text=True)
-            if push.returncode != 0:
-                print(f"  ❌ [{repo_name}] push failed: {push.stderr.strip()}")
+        if is_current:
+            # Commit staged/unstaged changes
+            subprocess.run(['git', 'add', '-A'], cwd=str(repo_dir), capture_output=True)
+            commit_result = subprocess.run(['git', 'commit', '-m', commit_msg],
+                                           cwd=str(repo_dir), capture_output=True, text=True)
+            if commit_result.returncode != 0 and 'nothing to commit' not in commit_result.stdout:
+                print(f"  ❌ commit failed: {commit_result.stderr.strip()}")
                 failed = True
                 continue
-            print(f"  ✅ [{repo_name}] pushed")
-
-            # Raise PR via gh
+            print(f"  committed")
+        else:
+            # Resolve base for this branch to find commits to cherry-pick
             suffix = branch.rsplit('--', 1)[1]
-            base_branch = None
-            if suffix in targets:
-                base_branch = targets[suffix].replace('origin/', '')
-            elif suffix.rstrip('x') in targets:
-                base_branch = targets[suffix.rstrip('x')].replace('origin/', '')
-            else:
-                base_branch = f"release/{suffix}"
+            origin_branch = targets.get(suffix, targets.get(suffix.rstrip('x'), f"origin/release/{suffix}"))
 
-            pr = subprocess.run(
-                ['gh', 'pr', 'create', '--repo', f"waterfield/{repo_name}",
-                 '--title', commit_msg, '--body', '',
-                 '--base', base_branch, '--head', branch],
+            src_result = subprocess.run(
+                ['git', 'log', '--pretty=format:%H', f"{origin_branch}..{current_branch}"],
                 cwd=str(repo_dir), capture_output=True, text=True
             )
-            if pr.returncode == 0:
-                print(f"  ✅ [{repo_name}] PR created: {pr.stdout.strip()}")
-            else:
-                print(f"  ❌ [{repo_name}] PR failed: {pr.stderr.strip()}")
-                failed = True
+            commits = [c for c in src_result.stdout.strip().split('\n') if c]
+            if not commits:
+                print(f"  no commits to cherry-pick from {current_branch}")
+                continue
+
+            print(f"  checking out {branch}")
+            subprocess.run(['git', 'checkout', branch], cwd=str(repo_dir), capture_output=True)
+
+            print(f"  cherry-picking {len(commits)} commit(s)")
+            for sha in reversed(commits):
+                cp = subprocess.run(['git', 'cherry-pick', sha],
+                                    cwd=str(repo_dir), capture_output=True, text=True)
+                if cp.returncode != 0:
+                    print(f"  ❌ cherry-pick {sha[:8]} failed: {cp.stderr.strip()}")
+                    print(f"     Resolve conflicts then run: git cherry-pick --continue")
+                    failed = True
+                    break
+
+        # Push
+        print(f"  pushing {branch}")
+        push = subprocess.run(['git', 'push', '-u', 'origin', branch],
+                              cwd=str(repo_dir), capture_output=True, text=True)
+        if push.returncode != 0:
+            print(f"  ❌ push failed: {push.stderr.strip()}")
+            failed = True
+            continue
+        print(f"  pushed")
+
+        # Determine base branch for PR
+        suffix = branch.rsplit('--', 1)[1]
+        origin_branch = targets.get(suffix, targets.get(suffix.rstrip('x'), f"origin/release/{suffix}"))
+        base_branch = origin_branch.replace('origin/', '')
+
+        pr = subprocess.run(
+            ['gh', 'pr', 'create', '--repo', f"waterfield/{repo_name}",
+             '--title', commit_msg, '--body', '',
+             '--base', base_branch, '--head', branch],
+            cwd=str(repo_dir), capture_output=True, text=True
+        )
+        if pr.returncode == 0:
+            url = pr.stdout.strip()
+            pr_links.append((branch, url))
+            print(f"  ✅ PR created: {url}")
+        else:
+            print(f"  ❌ PR failed: {pr.stderr.strip()}")
+            failed = True
+
+    print("\n── PRs raised " + "─" * 50)
+    if pr_links:
+        for branch, url in pr_links:
+            print(f"  {branch}: {url}")
+    else:
+        print("  (none succeeded)")
 
     return 1 if failed else 0
 

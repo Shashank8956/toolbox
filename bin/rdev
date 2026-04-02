@@ -19,10 +19,11 @@ from datetime import datetime
 
 SCRIPT_DIR  = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
-CONFIG_FILE = PROJECT_DIR / "config" / "rdev.yaml"
+CONFIG_FILE   = PROJECT_DIR / "config" / "rdev.yaml"
 MACHINES_FILE = PROJECT_DIR / "config" / "machines.yaml"
-STATE_FILE  = Path.home() / ".rdev_state"
-LOG_FILE    = PROJECT_DIR / "logs" / "rdev.log"
+PR_TEMPLATE   = PROJECT_DIR / "config" / "pr_template.md"
+STATE_FILE    = Path.home() / ".rdev_state"
+LOG_FILE      = PROJECT_DIR / "logs" / "rdev.log"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -259,6 +260,18 @@ def _is_pid_alive(pid):
         return True
     except (ProcessLookupError, PermissionError):
         return False
+
+
+def _pr_body(ticket, target_branch):
+    """Load pr_template.md and substitute ticket and target branch."""
+    if not PR_TEMPLATE.exists():
+        return ''
+    body = PR_TEMPLATE.read_text()
+    body = body.replace('{{TICKET}}', ticket)
+    # Strip origin/ prefix and trailing .m for display (e.g. release/24.2.18.1.m → 24.2.18.1.m)
+    display_branch = target_branch.replace('origin/release/', '').replace('origin/', '')
+    body = body.replace('{{TARGET_BRANCH}}', display_branch)
+    return body
 
 
 def _resolve_remote_path(server_ip, server_user, bastion, path):
@@ -698,7 +711,7 @@ def cmd_raise_pr(args):
 
         pr = subprocess.run(
             ['gh', 'pr', 'create', '--repo', f"waterfield/{repo_name}",
-             '--title', commit_msg, '--body', '',
+             '--title', commit_msg, '--body', _pr_body(ticket_normalized, origin_branch),
              '--base', base_branch, '--head', branch],
             cwd=str(repo_dir), capture_output=True, text=True
         )

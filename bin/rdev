@@ -1015,37 +1015,86 @@ def cmd_sync_logs(args):
 def print_usage():
     print("""
 rdev — Remote Dev Sync Tool
+Save a file locally → it appears on the remote. Run builds remotely with live output.
 
-Usage:
-  rdev start <server> [repo ...]   Start sync session (default repos from config)
-  rdev stop                        Stop active session and watcher daemon
-  rdev status                      Show session info and daemon health
-  rdev build [repo]                Run remote build, stream output live
-  rdev git <git-args>              Run git cmd locally + mirror on remote repos
-  rdev branch <TICKET> <suffix...>  Create local branches across repos for a ticket
-  rdev raise-pr "Commit message"   Commit, cherry-pick to siblings, push and raise PRs
-  rdev wgod [status|start|restart] Run wgod on active server (default: status)
-  rdev exec <cmd>                  Run any command on remote, stream output
-  rdev list                        List servers and configured repos
-  rdev logs                        Tail all *.log on remote in real-time
-  rdev logs <file>                 Tail specific log file in real-time
-  rdev logs -n <N>                 Show last N lines from all *.log
-  rdev logs <file> -n <N>          Show last N lines from specific file
-  rdev check [repo]                Diff local vs remote — show out-of-sync files
-  rdev sync-logs [n]               Show local rdev daemon log (default 50 lines)
-  rdev help                        Show this help
+━━━ SESSION ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Examples:
-  rdev start tallgrass-project
-  rdev start tallgrass-project go-ra
+  rdev start <server> [repo ...]   Start watching and syncing to a server
+                                   Repos default to config.default_repos
+  rdev stop                        Kill the sync daemon, clear session
+  rdev status                      Show server, watched repos, daemon health,
+                                   and last synced file
+
+  rdev list                        List all known servers and configured repos
+
+━━━ FILE SYNC ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  (automatic)                      Files sync on every save via fswatch + rsync
+  rdev check [repo]                Verify sync — show files that differ on remote
+                                   (dry-run, nothing is transferred)
+  rdev sync-logs [n]               Show last n lines of the daemon sync log
+                                   (default 50) — includes errors and timestamps
+
+━━━ BUILD ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  rdev build [repo]                Run the remote build for a repo, stream output
+                                   Defaults to first watched repo
+  rdev wgod [status|start|restart] Run wgod on the remote server (default: status)
+  rdev exec "<cmd>"                Run any command on the remote, stream output
+
+━━━ LOGS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  rdev logs                        Tail all *.log on remote in real-time (Ctrl+C)
+  rdev logs <file>                 Tail a specific log file in real-time
+  rdev logs -n <N>                 Show last N lines from all *.log (static)
+  rdev logs <file> -n <N>          Show last N lines from a specific file
+
+━━━ GIT & BRANCHING ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  rdev branch <TICKET> <suffix...> Create branches across all branch_repos
+    [--repos r1,r2]                Suffixes map via branch_targets in rdev.yaml:
+                                     24  → origin/release/24.x.x.x.m
+                                     25  → origin/release/25.x.x.x.m
+                                     dmt → origin/develop-mt
+                                   Also mirrors on remote if session is active.
+
+  rdev raise-pr "<message>"        Commit current branch, cherry-pick to all
+                                   sibling TICKET--* branches, push, and open
+                                   PRs via gh. Prints all PR links at the end.
+
+  rdev git <git-args>              Run a git command locally in erp root,
+                                   then mirror it on remote watched repos
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Examples — typical sprint workflow:
+
+  # 1. Start a session on your project server
+  rdev start exxon-project
+
+  # 2. Create branches for your ticket across all repos
+  rdev branch WEMAIN-34066 25 dmt
+
+  # 3. Edit code locally — files sync automatically on save
+  #    Confirm sync is working:
+  rdev status
+  rdev check
+
+  # 4. Build remotely and watch output
   rdev build go-ra
   rdev build revenue_accounting
+
+  # 5. Check app logs on the remote
   rdev logs
-  rdev logs production.log
-  rdev logs -n 100
-  rdev logs production.log -n 50
-  rdev git checkout main
-  rdev exec "ps aux | grep wgod"
+  rdev logs production.log -n 100
+
+  # 6. Restart the app if needed
+  rdev wgod restart
+
+  # 7. Raise PRs for all branches at once
+  rdev raise-pr "WEMAIN-34066: Fix visit_status filter for function columns"
+
+  # 8. Stop when done
   rdev stop
     """)
 

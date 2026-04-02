@@ -173,68 +173,143 @@ sqlrun shell
 
 ### rdev — Remote Dev Sync Tool
 
-Watches local code files and instantly syncs changes to a remote staging server. Run builds remotely with live output. Feels like working locally.
+Save a file locally → it instantly appears on the remote staging server. Run builds remotely with live output streamed back to your terminal. Manage branches and PRs across multiple repos in one command.
 
-**Use case:** You edit code in `/Users/you/code/wes/erp` locally. Every file save is instantly copied to the active remote server. Type `rdev build go-ra` and the remote build streams back to your terminal.
-
-#### Commands
-
-```bash
-rdev start <server> [repo ...]   # Start sync session (default: revenue_accounting + go-ra)
-rdev stop                        # Stop the sync daemon
-rdev status                      # Show session info and daemon health
-rdev build [repo]                # Run remote build, stream output live
-rdev git <git-args>              # Run git cmd locally + mirror on remote repos
-rdev exec <cmd>                  # Run any command on remote, stream output
-rdev list                        # List servers and configured repos
-rdev logs [n]                    # Show last n sync entries (default 50)
-```
-
-#### Example workflow
-
-```bash
-# Start watching tallgrass-project (syncs revenue_accounting + go-ra by default)
-rdev start tallgrass-project
-
-# Or watch a specific repo
-rdev start tallgrass-project go-ra
-
-# Save any file locally → it instantly appears on remote
-
-# Run a build (streams live output)
-rdev build go-ra
-rdev build revenue_accounting    # runs assets + restart + wgod
-
-# Switch branches everywhere at once
-rdev git checkout main
-
-# Run a one-off remote command
-rdev exec "ps aux | grep wgod"
-
-# Stop when done
-rdev stop
-```
+**Use case:** You have ~30 staging servers behind a bastion, each running the same polyglot monorepo (Ruby + Go). `rdev` removes all the friction: pick a server, edit code, build, tail logs, raise PRs — without ever manually SSHing in.
 
 #### How it works
 
-1. `rdev start` spawns a background daemon that runs `fswatch` on your local repo dirs
-2. On every file save, `rsync` sends just that file to the remote via SSH (ProxyJump bastion)
-3. `rdev build` SSHes in with a pseudo-TTY and runs the repo's configured build command
-4. Build output streams line-by-line to your terminal in real time
+1. `rdev start` spawns a background daemon running `fswatch` on your local repo dirs
+2. On every file save, `rsync` sends just that changed file to the active remote via ProxyJump
+3. `rdev build` SSHes in with a login shell and streams build output line-by-line
+4. `rdev check` does an rsync dry-run with checksum comparison to verify sync state
+
+#### Setup
+
+```bash
+brew install fswatch          # file watcher (required)
+cp config/rdev.yaml.example config/rdev.yaml
+# Fill in jump_host, local_root, and any repo-specific build commands
+```
+
+#### Typical sprint workflow
+
+```bash
+# 1. Pick a server and start syncing
+rdev start exxon-project
+
+# 2. Create branches across all repos for your ticket
+rdev branch WEMAIN-34066 25 dmt      # creates WEMAIN-34066--25x and WEMAIN-34066--dmt
+                                      # locally + on remote if session is active
+
+# 3. Edit code — files sync automatically on every save
+rdev status                           # confirm daemon is alive + see last synced file
+rdev check                            # verify remote matches local (byte-for-byte diff)
+rdev check go-ra                      # scope to one repo
+
+# 4. Build remotely and watch live output
+rdev build go-ra
+rdev build revenue_accounting         # runs assets + restart + wgod start
+
+# 5. Watch app logs on the remote
+rdev logs                             # tail all *.log in real-time (Ctrl+C to stop)
+rdev logs production.log              # tail a specific file
+rdev logs -n 100                      # last 100 lines, static (no follow)
+rdev logs production.log -n 50
+
+# 6. Manage the app server
+rdev wgod status
+rdev wgod restart
+
+# 7. Run any one-off remote command
+rdev exec "ps aux | grep puma"
+
+# 8. When ready — commit, cherry-pick to sibling branches, push, raise all PRs
+rdev raise-pr "WEMAIN-34066: Fix visit_status filter for function columns"
+# → prints PR links for every branch at the end
+
+# 9. Done
+rdev stop
+```
+
+#### Command reference
+
+**Session**
+
+| Command | Description |
+|---------|-------------|
+| `rdev start <server> [repo ...]` | Start sync session. Spawns background daemon. Repos default to `config.default_repos`. |
+| `rdev stop` | Kill daemon and clear session state. |
+| `rdev status` | Show server, watched repos, daemon health, last synced file + timestamp. |
+| `rdev list` | List all known servers and configured repos. |
+
+**File sync**
+
+| Command | Description |
+|---------|-------------|
+| *(automatic on save)* | Every file save triggers fswatch → rsync to remote. |
+| `rdev check [repo]` | Dry-run diff — shows files that differ between local and remote. Nothing is transferred. |
+| `rdev sync-logs [n]` | Show last n lines of the local daemon log (default 50). Includes sync errors and timestamps. |
+
+**Build & server**
+
+| Command | Description |
+|---------|-------------|
+| `rdev build [repo]` | Run the repo's configured build command on remote, stream output live. Defaults to first watched repo. |
+| `rdev wgod [status\|start\|restart]` | Run wgod on the active remote server. Default: `status`. |
+| `rdev exec "<cmd>"` | Run any command on the remote and stream output. |
+
+**Logs**
+
+| Command | Description |
+|---------|-------------|
+| `rdev logs` | Tail all `*.log` files on remote in real-time. |
+| `rdev logs <file>` | Tail a specific log file. |
+| `rdev logs -n <N>` | Show last N lines from all `*.log` (static, no follow). |
+| `rdev logs <file> -n <N>` | Show last N lines from a specific file. |
+
+**Git & branching**
+
+| Command | Description |
+|---------|-------------|
+| `rdev branch <TICKET> <suffix...>` | Create `TICKET--<suffix>` branches across all `branch_repos`. Pulls after checkout. Mirrors on remote if session active. Use `--repos r1,r2` to override repos. |
+| `rdev raise-pr "<message>"` | Commit current branch, cherry-pick new commits to all sibling `TICKET--*` branches, push all, open PRs via `gh`. Prints all PR links at the end. |
+| `rdev git <git-args>` | Run a git command locally in `local_root`, then mirror it on remote watched repos. |
+
+#### Branch suffixes
+
+Suffixes in `rdev branch` resolve via `branch_targets` in `rdev.yaml`:
+
+```
+24   → origin/release/24.x.x.x.m
+25   → origin/release/25.x.x.x.m
+dmt  → origin/develop-mt
+```
+
+Unknown suffixes are appended to `origin/release/` automatically. Update `branch_targets` each sprint when the release branch changes.
 
 #### Configuration
 
-Copy `config/rdev.yaml.example` to `config/rdev.yaml`:
+`config/rdev.yaml` (gitignored — copy from `.example`):
 
 ```yaml
 jump_host:
   user: "wti"
   ip: "your.bastion.ip"
 
-local_root: "/Users/you/code/wes/erp"
-remote_root: "/srv/www/apps"
+local_root: "/Users/you/code/wes/erp"   # parent of all repo dirs
+remote_root: "/srv/www/apps"             # base path on remote servers
 
-default_repos:
+branch_repos:                            # repos to create branches in
+  - revenue_accounting
+  - go-ra
+
+branch_targets:                          # suffix → origin branch (update each sprint)
+  dmt: origin/develop-mt
+  24: origin/release/24.2.18.1.m
+  25: origin/release/25.1.6.2.m
+
+default_repos:                           # repos watched when none specified in start
   - revenue_accounting
   - go-ra
 
@@ -242,12 +317,13 @@ repos:
   revenue_accounting:
     local_path: revenue_accounting
     remote_path: revenue_accounting
+    log_dir: log                         # used by rdev logs
     build:
       cmd: "assets && touch tmp/restart.txt"
       post_cmd: "wgod start && wgod status"
   go-ra:
     local_path: go-ra
-    remote_path: go-ra
+    remote_path: /home/wti/go*/src/ra    # glob resolved at session start
     build:
       cmd: "~/bin/build"
 ```
@@ -255,6 +331,7 @@ repos:
 #### Requirements
 
 - `fswatch`: `brew install fswatch`
+- `gh` (GitHub CLI): `brew install gh` — needed for `raise-pr`
 - SSH access through bastion (same setup as `rsh`)
 
 ---

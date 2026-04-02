@@ -389,6 +389,28 @@ def cmd_stop(args):
     return 0
 
 
+def _last_sync_from_log():
+    """Return (timestamp, file_path) of the most recent successful sync, or None."""
+    if not LOG_FILE.exists():
+        return None
+    try:
+        with open(LOG_FILE, 'rb') as f:
+            # Read last 8KB to find most recent Synced line
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 8192))
+            tail = f.read().decode('utf-8', errors='replace')
+        for line in reversed(tail.splitlines()):
+            if '[INFO] Synced:' in line:
+                # Format: "2026-04-02 18:53:31,463 [INFO] Synced: go-ra/grids/fields/user.go → ..."
+                ts = line.split(' [INFO]')[0].strip()
+                synced_part = line.split('Synced:')[1].split('→')[0].strip()
+                return ts, synced_part
+    except Exception:
+        pass
+    return None
+
+
 def cmd_status(args):
     """Show active session status."""
     sm = StateManager()
@@ -400,12 +422,17 @@ def cmd_status(args):
 
     pid = state.get('daemon_pid')
     alive = pid and _is_pid_alive(pid)
+    last_sync = _last_sync_from_log()
 
     print()
     print(f"  Server   : {state['server']} ({state.get('server_ip', '?')})")
     print(f"  Watching : {', '.join(state.get('watching', []))}")
     print(f"  Daemon   : PID {pid} {'✅ running' if alive else '❌ dead — run: rdev start ' + state['server']}")
     print(f"  Started  : {state.get('started_at', '?')}")
+    if last_sync:
+        print(f"  Last sync: {last_sync[1]}  ({last_sync[0]})")
+    else:
+        print(f"  Last sync: (none yet)")
     print()
     return 0
 
@@ -822,6 +849,71 @@ def cmd_exec(args):
     return _ssh_stream(state['server_ip'], state['server_user'], bastion, remote_cmd)
 
 
+def cmd_check(args):
+    """Check which files are out of sync between local and remote.
+
+    rdev check [repo]
+
+    Uses rsync dry-run with checksum comparison — no files are transferred.
+    Shows files that differ or are missing on remote. Prints 'All in sync' if
+    local and remote match.
+    """
+    sm = StateManager()
+    state = sm.require()
+    cm = ConfigManager()
+    cfg = cm.load()
+
+    local_root = cm.local_root()
+    remote_root = cm.remote_root()
+    bastion = cm.jump_host()
+
+    repo_names = [args[0]] if args else state['watching']
+
+    exclude_args = [
+        '--exclude=.git/',
+        '--exclude=__pycache__/',
+        '--exclude=*.pyc',
+        '--exclude=node_modules/',
+        '--exclude=tmp/',
+        '--exclude=log/',
+    ]
+
+    any_diff = False
+    for repo_name in repo_names:
+        repo = cm.get_repo(repo_name)
+        local_dir = str(local_root / repo['local_path']) + '/'
+        remote_dir = state.get('resolved_paths', {}).get(repo_name)
+        if not remote_dir:
+            rp = repo['remote_path']
+            remote_dir = rp if rp.startswith('/') else f"{remote_root}/{rp}"
+
+        print(f"\n[{repo_name}] checking against {state['server']}:{remote_dir}")
+
+        cmd = [
+            'rsync', '-rcn', '--checksum', '--out-format=%n',
+        ] + exclude_args + [
+            '-e', f"ssh -J {bastion} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
+            local_dir,
+            f"{state['server_user']}@{state['server_ip']}:{remote_dir}/",
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        diffs = [l for l in result.stdout.splitlines() if l.strip() and not l.endswith('/')]
+
+        if result.returncode != 0 and not diffs:
+            print(f"  ❌ rsync error: {result.stderr.strip()}")
+            any_diff = True
+        elif diffs:
+            any_diff = True
+            print(f"  {len(diffs)} file(s) out of sync:")
+            for f in diffs:
+                print(f"    {f}")
+        else:
+            print(f"  ✅ all in sync")
+
+    return 1 if any_diff else 0
+
+
 def cmd_list(args):
     """List servers and configured repos."""
     cm = ConfigManager()
@@ -939,6 +1031,7 @@ Usage:
   rdev logs <file>                 Tail specific log file in real-time
   rdev logs -n <N>                 Show last N lines from all *.log
   rdev logs <file> -n <N>          Show last N lines from specific file
+  rdev check [repo]                Diff local vs remote — show out-of-sync files
   rdev sync-logs [n]               Show local rdev daemon log (default 50 lines)
   rdev help                        Show this help
 
@@ -983,6 +1076,7 @@ def main():
         'raise-pr': cmd_raise_pr,
         'wgod':     cmd_wgod,
         'exec':   cmd_exec,
+        'check':  cmd_check,
         'list':   cmd_list,
         'logs':      cmd_logs,
         'sync-logs': cmd_sync_logs,

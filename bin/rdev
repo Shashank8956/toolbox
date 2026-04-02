@@ -698,13 +698,8 @@ def cmd_raise_pr(args):
     )
     feature_commits = [c for c in base_commits_result.stdout.strip().split('\n') if c]
 
-    if not feature_commits and sibling_branches:
-        print(f"❌ Current branch '{current_branch}' has no commits ahead of {current_base}.")
-        print(f"   Run raise-pr from the branch where you made your changes.")
-        return 1
-
     print(f"  Repo    : {repo_name}")
-    print(f"  Base    : {current_base} ({len(feature_commits)} commit(s) to carry)")
+    print(f"  Base    : {current_base} ({len(feature_commits)} commit(s) ahead + any uncommitted changes)")
     print(f"  Branches: {', '.join([current_branch] + sibling_branches)}")
 
     failed = False
@@ -719,11 +714,26 @@ def cmd_raise_pr(args):
             subprocess.run(['git', 'add', '-A'], cwd=str(repo_dir), capture_output=True)
             commit_result = subprocess.run(['git', 'commit', '-m', commit_msg],
                                            cwd=str(repo_dir), capture_output=True, text=True)
-            if commit_result.returncode != 0 and 'nothing to commit' not in commit_result.stdout:
-                print(f"  ❌ commit failed: {commit_result.stderr.strip()}")
+            if commit_result.returncode != 0:
+                if 'nothing to commit' in commit_result.stdout or 'nothing to commit' in commit_result.stderr:
+                    print(f"  nothing new to commit")
+                else:
+                    print(f"  ❌ commit failed: {commit_result.stderr.strip()}")
+                    failed = True
+                    continue
+
+            # Re-fetch feature_commits now that current branch may have a new commit
+            base_commits_result = subprocess.run(
+                ['git', 'log', '--pretty=format:%H', f"{current_base}..{current_branch}"],
+                cwd=str(repo_dir), capture_output=True, text=True
+            )
+            feature_commits = [c for c in base_commits_result.stdout.strip().split('\n') if c]
+
+            if not feature_commits:
+                print(f"  ❌ No commits to carry — nothing to commit and no prior commits on this branch.")
                 failed = True
                 continue
-            print(f"  committed")
+            print(f"  committed ({len(feature_commits)} commit(s) total to carry)")
         else:
             if not feature_commits:
                 print(f"  no commits to cherry-pick")

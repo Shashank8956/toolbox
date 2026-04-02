@@ -545,6 +545,8 @@ def cmd_branch(args):
     cfg = cm.load()
 
     ticket = args[0].replace('\u2013', '-').replace('\u2014', '-')
+    if ticket.isdigit():
+        ticket = f"WEMAIN-{ticket}"
     rest = args[1:]
 
     # Parse optional --repos override

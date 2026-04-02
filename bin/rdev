@@ -595,16 +595,25 @@ def cmd_raise_pr(args):
                             cwd=str(repo_dir), capture_output=True, text=True)
     current_branch = result.stdout.strip()
 
-    if '--' not in current_branch:
+    # Normalize em-dash variants (–- or —) to double hyphen for parsing
+    normalized_branch = current_branch.replace('\u2013-', '--').replace('\u2014', '--')
+
+    if '--' not in normalized_branch:
         print(f"❌ Current branch '{current_branch}' doesn't match TICKET--SUFFIX format")
         return 1
 
-    ticket = current_branch.rsplit('--', 1)[0]
+    ticket_normalized = normalized_branch.rsplit('--', 1)[0]
+    # ticket prefix in actual branch name may still have em-dash; derive from current_branch directly
+    ticket_raw = current_branch[:len(ticket_normalized)]
 
-    # Find all sibling branches in this repo
-    result = subprocess.run(['git', 'branch', '--list', f"{ticket}--*"],
+    # Find all sibling branches (match both -- and –- variants)
+    result = subprocess.run(['git', 'branch', '--list'],
                             cwd=str(repo_dir), capture_output=True, text=True)
-    all_branches = [b.strip().lstrip('* ') for b in result.stdout.splitlines() if b.strip()]
+    all_branches_raw = [b.strip().lstrip('* ') for b in result.stdout.splitlines() if b.strip()]
+    # Normalize each branch name for comparison, keep original for git ops
+    def normalize(b):
+        return b.replace('\u2013-', '--').replace('\u2014', '--')
+    all_branches = [b for b in all_branches_raw if normalize(b).startswith(ticket_normalized + '--')]
     sibling_branches = [b for b in all_branches if b != current_branch]
 
     if not sibling_branches:
@@ -632,7 +641,7 @@ def cmd_raise_pr(args):
             print(f"  committed")
         else:
             # Resolve base for this branch to find commits to cherry-pick
-            suffix = branch.rsplit('--', 1)[1]
+            suffix = normalize(branch).rsplit('--', 1)[1]
             origin_branch = targets.get(suffix, targets.get(suffix.rstrip('x'), f"origin/release/{suffix}"))
 
             src_result = subprocess.run(
@@ -668,7 +677,7 @@ def cmd_raise_pr(args):
         print(f"  pushed")
 
         # Determine base branch for PR
-        suffix = branch.rsplit('--', 1)[1]
+        suffix = normalize(branch).rsplit('--', 1)[1]
         origin_branch = targets.get(suffix, targets.get(suffix.rstrip('x'), f"origin/release/{suffix}"))
         base_branch = origin_branch.replace('origin/', '')
 

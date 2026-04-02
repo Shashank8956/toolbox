@@ -564,6 +564,12 @@ def cmd_branch(args):
                 ['git', 'checkout', '-b', branch_name, origin_branch],
                 cwd=str(repo_dir), capture_output=True, text=True
             )
+            if result.returncode != 0 and 'already exists' in result.stderr:
+                print(f"  [{repo_name}] branch exists, switching to it")
+                result = subprocess.run(
+                    ['git', 'checkout', branch_name],
+                    cwd=str(repo_dir), capture_output=True, text=True
+                )
             if result.returncode == 0:
                 print(f"  [{repo_name}] git pull")
                 subprocess.run(['git', 'pull'], cwd=str(repo_dir))

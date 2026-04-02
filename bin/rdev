@@ -628,6 +628,11 @@ def cmd_raise_pr(args):
     )
     feature_commits = [c for c in base_commits_result.stdout.strip().split('\n') if c]
 
+    if not feature_commits and sibling_branches:
+        print(f"❌ Current branch '{current_branch}' has no commits ahead of {current_base}.")
+        print(f"   Run raise-pr from the branch where you made your changes.")
+        return 1
+
     print(f"  Repo    : {repo_name}")
     print(f"  Base    : {current_base} ({len(feature_commits)} commit(s) to carry)")
     print(f"  Branches: {', '.join([current_branch] + sibling_branches)}")
@@ -657,6 +662,7 @@ def cmd_raise_pr(args):
             print(f"  checking out {branch}")
             subprocess.run(['git', 'checkout', branch], cwd=str(repo_dir), capture_output=True)
 
+            cherry_pick_failed = False
             print(f"  cherry-picking {len(feature_commits)} commit(s)")
             for sha in reversed(feature_commits):
                 cp = subprocess.run(['git', 'cherry-pick', sha],
@@ -670,7 +676,10 @@ def cmd_raise_pr(args):
                         print(f"  ❌ cherry-pick {sha[:8]} failed: {stderr}")
                         print(f"     Resolve conflicts then run: git cherry-pick --continue")
                         failed = True
+                        cherry_pick_failed = True
                         break
+            if cherry_pick_failed:
+                continue
 
         # Push
         print(f"  pushing {branch}")
@@ -698,8 +707,22 @@ def cmd_raise_pr(args):
             pr_links.append((branch, url))
             print(f"  ✅ PR created: {url}")
         else:
-            print(f"  ❌ PR failed: {pr.stderr.strip()}")
-            failed = True
+            stderr = pr.stderr.strip()
+            if 'already exists' in stderr.lower():
+                # Fetch existing PR URL
+                existing = subprocess.run(
+                    ['gh', 'pr', 'view', branch, '--repo', f"waterfield/{repo_name}", '--json', 'url', '--jq', '.url'],
+                    cwd=str(repo_dir), capture_output=True, text=True
+                )
+                url = existing.stdout.strip()
+                if url:
+                    pr_links.append((branch, url))
+                    print(f"  ✅ PR already exists: {url}")
+                else:
+                    print(f"  ⚠️  PR already exists (could not fetch URL)")
+            else:
+                print(f"  ❌ PR failed: {stderr}")
+                failed = True
 
     print("\n── PRs raised " + "─" * 50)
     if pr_links:

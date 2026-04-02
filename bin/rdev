@@ -619,7 +619,17 @@ def cmd_raise_pr(args):
     if not sibling_branches:
         print(f"No sibling branches found for {ticket}. Raising PR only for current branch.")
 
+    # Compute the current branch's own base (commits the user actually made)
+    current_suffix = normalize(current_branch).rsplit('--', 1)[1]
+    current_base = targets.get(current_suffix, targets.get(current_suffix.rstrip('x'), f"origin/release/{current_suffix}"))
+    base_commits_result = subprocess.run(
+        ['git', 'log', '--pretty=format:%H', f"{current_base}..{current_branch}"],
+        cwd=str(repo_dir), capture_output=True, text=True
+    )
+    feature_commits = [c for c in base_commits_result.stdout.strip().split('\n') if c]
+
     print(f"  Repo    : {repo_name}")
+    print(f"  Base    : {current_base} ({len(feature_commits)} commit(s) to carry)")
     print(f"  Branches: {', '.join([current_branch] + sibling_branches)}")
 
     failed = False
@@ -640,31 +650,27 @@ def cmd_raise_pr(args):
                 continue
             print(f"  committed")
         else:
-            # Resolve base for this branch to find commits to cherry-pick
-            suffix = normalize(branch).rsplit('--', 1)[1]
-            origin_branch = targets.get(suffix, targets.get(suffix.rstrip('x'), f"origin/release/{suffix}"))
-
-            src_result = subprocess.run(
-                ['git', 'log', '--pretty=format:%H', f"{origin_branch}..{current_branch}"],
-                cwd=str(repo_dir), capture_output=True, text=True
-            )
-            commits = [c for c in src_result.stdout.strip().split('\n') if c]
-            if not commits:
-                print(f"  no commits to cherry-pick from {current_branch}")
+            if not feature_commits:
+                print(f"  no commits to cherry-pick")
                 continue
 
             print(f"  checking out {branch}")
             subprocess.run(['git', 'checkout', branch], cwd=str(repo_dir), capture_output=True)
 
-            print(f"  cherry-picking {len(commits)} commit(s)")
-            for sha in reversed(commits):
+            print(f"  cherry-picking {len(feature_commits)} commit(s)")
+            for sha in reversed(feature_commits):
                 cp = subprocess.run(['git', 'cherry-pick', sha],
                                     cwd=str(repo_dir), capture_output=True, text=True)
                 if cp.returncode != 0:
-                    print(f"  ❌ cherry-pick {sha[:8]} failed: {cp.stderr.strip()}")
-                    print(f"     Resolve conflicts then run: git cherry-pick --continue")
-                    failed = True
-                    break
+                    stderr = cp.stderr.strip()
+                    if 'empty' in stderr.lower() or 'allow-empty' in stderr:
+                        subprocess.run(['git', 'cherry-pick', '--skip'], cwd=str(repo_dir), capture_output=True)
+                        print(f"  skipped already-present commit {sha[:8]}")
+                    else:
+                        print(f"  ❌ cherry-pick {sha[:8]} failed: {stderr}")
+                        print(f"     Resolve conflicts then run: git cherry-pick --continue")
+                        failed = True
+                        break
 
         # Push
         print(f"  pushing {branch}")

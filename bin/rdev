@@ -675,22 +675,35 @@ def cmd_raise_pr(args):
             print(f"  checking out {branch}")
             subprocess.run(['git', 'checkout', branch], cwd=str(repo_dir), capture_output=True)
 
+            # Use git cherry to find commits not yet applied to this branch (by patch content)
+            cherry_result = subprocess.run(
+                ['git', 'cherry', branch, current_branch],
+                cwd=str(repo_dir), capture_output=True, text=True
+            )
+            pending_shas = set(
+                line.split()[1] for line in cherry_result.stdout.splitlines()
+                if line.startswith('+')
+            )
+            commits_to_apply = [sha for sha in reversed(feature_commits) if sha in pending_shas]
+            already_present = len(feature_commits) - len(commits_to_apply)
+            if already_present:
+                print(f"  {already_present} commit(s) already present on {branch}, skipping")
+            if not commits_to_apply:
+                print(f"  nothing new to cherry-pick")
+            else:
+                print(f"  cherry-picking {len(commits_to_apply)} commit(s)")
+
             cherry_pick_failed = False
-            print(f"  cherry-picking {len(feature_commits)} commit(s)")
-            for sha in reversed(feature_commits):
+            for sha in commits_to_apply:
                 cp = subprocess.run(['git', 'cherry-pick', sha],
                                     cwd=str(repo_dir), capture_output=True, text=True)
                 if cp.returncode != 0:
                     stderr = cp.stderr.strip()
-                    if 'empty' in stderr.lower() or 'allow-empty' in stderr:
-                        subprocess.run(['git', 'cherry-pick', '--skip'], cwd=str(repo_dir), capture_output=True)
-                        print(f"  skipped already-present commit {sha[:8]}")
-                    else:
-                        print(f"  ❌ cherry-pick {sha[:8]} failed: {stderr}")
-                        print(f"     Resolve conflicts then run: git cherry-pick --continue")
-                        failed = True
-                        cherry_pick_failed = True
-                        break
+                    print(f"  ❌ cherry-pick {sha[:8]} failed: {stderr}")
+                    print(f"     Resolve conflicts then run: git cherry-pick --continue")
+                    failed = True
+                    cherry_pick_failed = True
+                    break
             if cherry_pick_failed:
                 continue
 

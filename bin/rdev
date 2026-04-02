@@ -537,6 +537,15 @@ def cmd_branch(args):
 
     targets = {str(k): v for k, v in cfg.get('branch_targets', {}).items()}
     local_root = Path(cfg['local_root'])
+    remote_root = cm.remote_root()
+    bastion = cm.jump_host()
+
+    # Load active session if any (optional — branch works without one)
+    sm = StateManager()
+    try:
+        state = sm.require()
+    except SystemExit:
+        state = None
 
     failed = False
     for suffix in suffixes:
@@ -558,6 +567,19 @@ def cmd_branch(args):
             if result.returncode == 0:
                 print(f"  [{repo_name}] git pull")
                 subprocess.run(['git', 'pull'], cwd=str(repo_dir))
+
+                if state:
+                    repo_cfg = cfg['repos'][repo_name]
+                    remote_dir = state.get('resolved_paths', {}).get(repo_name)
+                    if not remote_dir:
+                        rp = repo_cfg['remote_path']
+                        remote_dir = rp if rp.startswith('/') else f"{remote_root}/{rp}"
+                    remote_cmd = f"cd {remote_dir} && git checkout -b {branch_name} {origin_branch} 2>/dev/null || git checkout {branch_name} && git pull"
+                    print(f"  [{repo_name}] remote: git checkout -b {branch_name} {origin_branch}")
+                    subprocess.run(
+                        _ssh_base(state['server_ip'], state['server_user'], bastion) + [remote_cmd]
+                    )
+
                 print(f"  ✅ {repo_name}: done")
             else:
                 print(f"  ❌ {repo_name}: {result.stderr.strip()}")

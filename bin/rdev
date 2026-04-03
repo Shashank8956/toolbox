@@ -862,18 +862,17 @@ def cmd_exec(args):
 
 
 def cmd_check(args):
-    """Check which files are out of sync between local and remote.
+    """Check if locally modified files have been synced to the remote.
 
     rdev check [repo]
 
-    Uses rsync dry-run with checksum comparison — no files are transferred.
-    Shows files that differ or are missing on remote. Prints 'All in sync' if
-    local and remote match.
+    Uses git status to find locally modified/untracked files, then does an
+    rsync dry-run with checksum for each one. Only shows files you changed —
+    not the entire repo diff.
     """
     sm = StateManager()
     state = sm.require()
     cm = ConfigManager()
-    cfg = cm.load()
 
     local_root = cm.local_root()
     remote_root = cm.remote_root()
@@ -881,47 +880,63 @@ def cmd_check(args):
 
     repo_names = [args[0]] if args else state['watching']
 
-    exclude_args = [
-        '--exclude=.git/',
-        '--exclude=__pycache__/',
-        '--exclude=*.pyc',
-        '--exclude=node_modules/',
-        '--exclude=tmp/',
-        '--exclude=log/',
-    ]
-
     any_diff = False
     for repo_name in repo_names:
         repo = cm.get_repo(repo_name)
-        local_dir = str(local_root / repo['local_path']) + '/'
+        repo_dir = local_root / repo['local_path']
         remote_dir = state.get('resolved_paths', {}).get(repo_name)
         if not remote_dir:
             rp = repo['remote_path']
             remote_dir = rp if rp.startswith('/') else f"{remote_root}/{rp}"
 
-        print(f"\n[{repo_name}] checking against {state['server']}:{remote_dir}")
+        # Get locally modified/untracked files from git
+        git_result = subprocess.run(
+            ['git', 'status', '--short', '--porcelain'],
+            cwd=str(repo_dir), capture_output=True, text=True
+        )
+        changed_files = []
+        for line in git_result.stdout.splitlines():
+            # format: XY filename  (X=index, Y=worktree, then space, then path)
+            status = line[:2].strip()
+            path = line[3:].strip().strip('"')
+            if path and status != '??':  # skip untracked
+                changed_files.append(path)
 
-        cmd = [
-            'rsync', '-rcn', '--checksum', '--out-format=%n',
-        ] + exclude_args + [
-            '-e', f"ssh -J {bastion} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
-            local_dir,
-            f"{state['server_user']}@{state['server_ip']}:{remote_dir}/",
-        ]
+        print(f"\n[{repo_name}] {len(changed_files)} locally modified file(s)")
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        diffs = [l for l in result.stdout.splitlines() if l.strip() and not l.endswith('/')]
+        if not changed_files:
+            print(f"  ✅ nothing modified locally")
+            continue
 
-        if result.returncode != 0 and not diffs:
-            print(f"  ❌ rsync error: {result.stderr.strip()}")
+        not_synced = []
+        synced = []
+        for rel_path in changed_files:
+            local_file = str(repo_dir / rel_path)
+            remote_file_dir = f"{remote_dir}/{Path(rel_path).parent}"
+            if remote_file_dir.endswith('/.'):
+                remote_file_dir = remote_file_dir[:-2]
+
+            cmd = [
+                'rsync', '-rcn', '--checksum', '--out-format=%n',
+                '-e', f"ssh -J {bastion} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
+                local_file,
+                f"{state['server_user']}@{state['server_ip']}:{remote_file_dir}/",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.stdout.strip():
+                not_synced.append(rel_path)
+            else:
+                synced.append(rel_path)
+
+        if not_synced:
             any_diff = True
-        elif diffs:
-            any_diff = True
-            print(f"  {len(diffs)} file(s) out of sync:")
-            for f in diffs:
+            print(f"  ❌ not yet synced to remote:")
+            for f in not_synced:
                 print(f"    {f}")
-        else:
-            print(f"  ✅ all in sync")
+        if synced:
+            print(f"  ✅ synced:")
+            for f in synced:
+                print(f"    {f}")
 
     return 1 if any_diff else 0
 
@@ -1042,8 +1057,8 @@ Save a file locally → it appears on the remote. Run builds remotely with live 
 ━━━ FILE SYNC ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   (automatic)                      Files sync on every save via fswatch + rsync
-  rdev check [repo]                Verify sync — show files that differ on remote
-                                   (dry-run, nothing is transferred)
+  rdev check [repo]                For each locally modified file (git status),
+                                   show whether it has been synced to remote
   rdev sync-logs [n]               Show last n lines of the daemon sync log
                                    (default 50) — includes errors and timestamps
 

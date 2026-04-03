@@ -466,7 +466,7 @@ def cmd_build(args):
 
     rc = _ssh_stream(
         state['server_ip'], state['server_user'], bastion,
-        f"bash -li -c 'cd {remote_dir} && {build_cmd}'"
+        f"bash -li -c 'cd {remote_dir} && rvm use . 2>/dev/null; {build_cmd}'"
     )
 
     print("─" * 60)
@@ -477,7 +477,7 @@ def cmd_build(args):
         print("─" * 60)
         rc = _ssh_stream(
             state['server_ip'], state['server_user'], bastion,
-            f"bash -li -c 'cd {remote_dir} && {post_cmd}'"
+            f"bash -li -c 'cd {remote_dir} && rvm use . 2>/dev/null; {post_cmd}'"
         )
         print("─" * 60)
 
